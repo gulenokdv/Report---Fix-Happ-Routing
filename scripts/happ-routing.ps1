@@ -713,7 +713,7 @@ function Invoke-UiShutdown {
 
             if ($ShowBackgroundNotice -and -not $noticeShown) {
                 try {
-                    Show-WindowsNotification -Title 'Happ Routing Fix' -Message 'Фикс продолжает работать в фоне. Повторный запуск батника снова откроет консоль.'
+                    Show-WindowsNotification -Title 'Happ Routing Fix' -Message 'Фикс продолжает работать в фоне. Повторный запуск батника раскроет существующую консоль.'
                     Update-State -Values @{ background_notice_shown = 'true' }
                     Write-AppLog 'Показано уведомление о работе фикса в фоне.'
                 }
@@ -781,7 +781,7 @@ function Wait-UiCloseAndNotify {
     }
 
     try {
-        Show-WindowsNotification -Title 'Happ Routing Fix' -Message 'Фикс продолжает работать в фоне. Повторный запуск батника снова откроет это окно.'
+        Show-WindowsNotification -Title 'Happ Routing Fix' -Message 'Фикс продолжает работать в фоне. Повторный запуск батника раскроет существующую консоль.'
         Update-State -Values @{ background_notice_shown = 'true' }
         Write-AppLog 'Показано уведомление о работе фикса в фоне.'
     }
