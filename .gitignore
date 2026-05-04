@@ -3,6 +3,8 @@ happ-routing-state.json
 happ-routing.log
 happ-routing-remote-config-cache.json
 serv/*
+!serv/happ-routing-app.json
 !serv/happ-routing-remote-config.json
+serv/update-state.json
 w
 *.codex-backup
