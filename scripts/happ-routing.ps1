@@ -1699,6 +1699,161 @@ function Open-UpdateDownloadPage {
     }
 }
 
+function Get-LatestReleaseAsset {
+    param(
+        [string]$RepoOwner,
+        [string]$RepoName,
+        [string]$AssetPattern
+    )
+
+    $apiUrl = "https://api.github.com/repos/$RepoOwner/$RepoName/releases/latest"
+    
+    try {
+        $headers = @{
+            'User-Agent' = 'HappRoutingFix/1.0'
+        }
+        $release = Invoke-RestMethod -Uri $apiUrl -Headers $headers -Method Get
+        
+        if ($null -eq $release -or $null -eq $release.assets) {
+            throw "Release не найден или пуст"
+        }
+
+        foreach ($asset in $release.assets) {
+            if ($asset.name -match $AssetPattern) {
+                return @{
+                    browser_download_url = $asset.browser_download_url
+                    name = $asset.name
+                    version = $release.tag_name
+                }
+            }
+        }
+
+        throw "Asset с паттерном '$AssetPattern' не найден"
+    }
+    catch {
+        throw $_.Exception.Message
+    }
+}
+
+function Test-ReleaseAssetValid {
+    param([string]$ZipPath)
+
+    try {
+        $requiredItems = @('happ-routing-fix.bat', 'scripts', 'serv')
+        
+        $tempExtract = Join-Path -Path (Get-Item $env:TEMP).FullName -ChildPath ('verify-{0}' -f [Guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Force -Path $tempExtract | Out-Null
+        
+        try {
+            Add-Type -AssemblyName System.IO.Compression.FileSystem
+            $zip = [System.IO.Compression.ZipFile]::OpenRead($ZipPath)
+            
+            $found = @{}
+            foreach ($entry in $zip.Entries) {
+                $name = $entry.Name.ToLowerInvariant()
+                if ($name -eq 'happ-routing-fix.bat') { $found['bat'] = $true }
+                if ($name -eq 'happ-routing.ps1') { $found['ps1'] = $true }
+                if ($entry.FullName.ToLowerInvariant().StartsWith('serv/')) { $found['serv'] = $true }
+                if ($entry.FullName.ToLowerInvariant().StartsWith('scripts/')) { $found['scripts'] = $true }
+            }
+            $zip.Dispose()
+            
+            return ($found['bat'] -and $found['ps1'] -and $found['serv'] -and $found['scripts'])
+        }
+        finally {
+            if (Test-Path -LiteralPath $tempExtract) {
+                Remove-Item -LiteralPath $tempExtract -Recurse -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
+    catch {
+        return $false
+    }
+}
+
+function Start-SelfUpdate {
+    try {
+        Write-AppLog 'Начало автообновления...'
+
+        # 1. Получить информацию о latest release
+        $releaseInfo = Get-LatestReleaseAsset -RepoOwner 'gulenokdv' -RepoName 'Report---Fix-Happ-Routing' -AssetPattern 'Report-Happ-routing-fix\.zip'
+        
+        Write-AppLog ("Найдена версия: {0}, файл: {1}" -f $releaseInfo.version, $releaseInfo.name)
+
+        # 2. Скачать zip во временную папку
+        $tempDir = Join-Path -Path (Get-Item $env:TEMP).FullName -ChildPath ('happ-update-{0}' -f [Guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Force -Path $tempDir | Out-Null
+        
+        $zipPath = Join-Path -Path $tempDir -ChildPath $releaseInfo.name
+        $extractPath = Join-Path -Path $tempDir -ChildPath 'staging'
+
+        try {
+            Write-AppLog 'Скачивание релиза...'
+            Invoke-WebRequest -Uri $releaseInfo.browser_download_url -OutFile $zipPath
+            
+            # 3. Проверить валидность zip
+            Write-AppLog 'Проверка архива...'
+            if (-not (Test-ReleaseAssetValid -ZipPath $zipPath)) {
+                throw "Архив не валиден: отсутствуют обязательные файлы"
+            }
+
+            # 4. Распаковать
+            Write-AppLog 'Распаковка...'
+            Add-Type -AssemblyName System.IO.Compression.FileSystem
+            [System.IO.Compression.ZipFile]::ExtractToDirectory($zipPath, $extractPath)
+
+            # 5. Найти папку с файлами (может быть вложенной)
+            $actualStaging = $extractPath
+            $items = Get-ChildItem -Path $extractPath -Directory
+            if ($items.Count -eq 1) {
+                $actualStaging = $items[0].FullName
+            }
+
+            # 6. Подготовить updater
+            $updaterSrc = Join-Path -Path $ScriptRoot -ChildPath 'happ-routing-updater.ps1'
+            if (-not (Test-Path -LiteralPath $updaterSrc)) {
+                throw "Updater не найден: $updaterSrc"
+            }
+            
+            $updaterTemp = Join-Path -Path $tempDir -ChildPath 'updater.ps1'
+            Copy-Item -Path $updaterSrc -Destination $updaterTemp -Force
+
+            # 7. Записать update-state
+            $updateStatePath = Join-Path -Path $AppRoot -ChildPath 'serv\update-state.json'
+            $state = @{
+                started_at = (Get-Date).ToString('o')
+                target_version = $releaseInfo.version
+                staging_path = $actualStaging
+                install_path = $AppRoot
+                status = 'downloading'
+            }
+            Set-Content -LiteralPath $updateStatePath -Value ($state | ConvertTo-Json -Depth 10) -Encoding UTF8
+
+            # 8. Запустить updater
+            Write-AppLog 'Запуск updater...'
+            $uiPid = [string](Get-AppInfo).ui_pid
+            $argumentLine = ('-NoLogo -NoProfile -ExecutionPolicy Bypass -File "{0}" -StagingPath "{1}" -InstallPath "{2}" -CurrentVersion "{3}" -UiPid "{4}"' -f `
+                $updaterTemp, $actualStaging, $AppRoot, $releaseInfo.version, $uiPid)
+            
+            Start-Process -FilePath 'powershell.exe' -ArgumentList $argumentLine -WindowStyle Normal
+            
+            # 9. Выйти из текущей консоли
+            Write-AppLog 'Обновление запущено. Закрытие текущей консоли...'
+            exit 0
+        }
+        catch {
+            if (Test-Path -LiteralPath $tempDir) {
+                Remove-Item -LiteralPath $tempDir -Recurse -Force -ErrorAction SilentlyContinue
+            }
+            throw
+        }
+    }
+    catch {
+        Write-AppLogLimited -Key 'self-update-error' -Message ('Ошибка автообновления: ' + $_.Exception.Message)
+        Update-State -Values @{ status = 'ошибка обновления'; last_error_message = $_.Exception.Message }
+    }
+}
+
 function Request-UiFlash {
     Update-State -Values @{ ui_flash_request = (Get-Date).ToString('o') }
 }
@@ -1853,7 +2008,7 @@ function Handle-UiKey {
 
     if ($display.update_prompt_visible -and ($key -eq 89)) {
         Dismiss-UpdatePrompt -RemoteConfig $display.remote_config
-        Open-UpdateDownloadPage -Url ([string]$display.update_download_url)
+        Start-SelfUpdate
         return $true
     }
 

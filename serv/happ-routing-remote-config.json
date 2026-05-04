@@ -1,6 +1,6 @@
 ﻿{
-    "message":  "test auto-update1",
-    "latest_version":  "0.1.3",
+    "message":  "test auto-update2",
+    "latest_version":  "0.1.4",
     "type":  "update",
     "disable_fix":  false,
     "download_url":  "https://github.com/gulenokdv/Report---Fix-Happ-Routing"
