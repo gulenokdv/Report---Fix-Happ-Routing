@@ -1,5 +1,7 @@
 happ-routing-settings.json
 happ-routing-state.json
 happ-routing.log
+serv/*
+!serv/happ-routing-remote-config.json
 w
 *.codex-backup

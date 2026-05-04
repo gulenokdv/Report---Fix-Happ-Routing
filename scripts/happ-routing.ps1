@@ -29,10 +29,13 @@ if ((Split-Path -Path $ScriptRoot -Leaf) -eq 'scripts') {
 }
 $PatchScript = Join-Path -Path $ScriptRoot -ChildPath 'patch-happ-config.ps1'
 $ConfigPath = "$env:LOCALAPPDATA\Happ\config.json"
+$AppInfoPath = Join-Path -Path $AppRoot -ChildPath 'serv\happ-routing-app.json'
 $SettingsPath = Join-Path -Path $AppRoot -ChildPath 'happ-routing-settings.json'
 $StatePath = Join-Path -Path $AppRoot -ChildPath 'happ-routing-state.json'
+$RemoteConfigPath = Join-Path -Path $AppRoot -ChildPath 'serv\happ-routing-remote-config.json'
 $LogPath = Join-Path -Path $AppRoot -ChildPath 'happ-routing.log'
 $RulesDir = Join-Path -Path $AppRoot -ChildPath 'rulesets'
+$DefaultAppVersion = '0.1.0'
 $UiWindowTitle = 'Happ Routing Fix by gulenok91'
 $AutostartRunKeyPath = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 $AutostartRunSubKeyPath = 'Software\Microsoft\Windows\CurrentVersion\Run'
@@ -133,6 +136,22 @@ function Write-Utf8BomFile {
     if ($null -ne $lastError) {
         throw $lastError
     }
+}
+
+function Read-Utf8JsonFile {
+    param([string]$Path)
+
+    return (Get-Content -LiteralPath $Path -Raw -Encoding UTF8) | ConvertFrom-Json
+}
+
+function ConvertTo-ReadableJson {
+    param([object]$InputObject)
+
+    $json = $InputObject | ConvertTo-Json -Depth 10
+    return [regex]::Replace($json, '\\u([0-9a-fA-F]{4})', {
+        param($match)
+        return [char][Convert]::ToInt32($match.Groups[1].Value, 16)
+    })
 }
 
 function Write-AppLog {
@@ -263,7 +282,69 @@ function Get-DefaultSettings {
 
 function Save-Settings {
     param([hashtable]$Settings)
-    Write-Utf8BomFile -Path $SettingsPath -Content (([pscustomobject]$Settings) | ConvertTo-Json -Depth 10)
+    Write-Utf8BomFile -Path $SettingsPath -Content (ConvertTo-ReadableJson -InputObject ([pscustomobject]$Settings))
+}
+
+function Get-DefaultAppInfo {
+    return @{
+        current_version     = $DefaultAppVersion
+        remote_config_url   = 'https://raw.githubusercontent.com/gulenokdv/Report---Fix-Happ-Routing/main/serv/happ-routing-remote-config.json'
+        download_page_url   = 'https://github.com/gulenokdv/Report---Fix-Happ-Routing'
+    }
+}
+
+function Save-AppInfo {
+    param([hashtable]$AppInfo)
+    Write-Utf8BomFile -Path $AppInfoPath -Content (ConvertTo-ReadableJson -InputObject ([pscustomobject]$AppInfo))
+}
+
+function Get-AppInfo {
+    $appInfo = Get-DefaultAppInfo
+    $needsSave = $false
+
+    if (Test-Path -LiteralPath $AppInfoPath) {
+        try {
+            $loaded = Read-Utf8JsonFile -Path $AppInfoPath
+            if ($loaded.PSObject.Properties['current_version']) {
+                $appInfo.current_version = [string]$loaded.current_version
+            }
+            if ($loaded.PSObject.Properties['remote_config_url']) {
+                $appInfo.remote_config_url = [string]$loaded.remote_config_url
+            }
+            if ($loaded.PSObject.Properties['download_page_url']) {
+                $appInfo.download_page_url = [string]$loaded.download_page_url
+            }
+        }
+        catch {
+            $needsSave = $true
+        }
+    }
+    else {
+        $needsSave = $true
+    }
+
+    if ([string]::IsNullOrWhiteSpace([string]$appInfo.current_version)) {
+        $appInfo.current_version = $DefaultAppVersion
+        $needsSave = $true
+    }
+
+    if ($needsSave) {
+        Save-AppInfo -AppInfo $appInfo
+    }
+
+    return [pscustomobject]$appInfo
+}
+
+function Get-AppVersion {
+    return [string](Get-AppInfo).current_version
+}
+
+function Get-RemoteConfigUrl {
+    return [string](Get-AppInfo).remote_config_url
+}
+
+function Get-DefaultDownloadPageUrl {
+    return [string](Get-AppInfo).download_page_url
 }
 
 function Get-Settings {
@@ -272,7 +353,7 @@ function Get-Settings {
 
     if (Test-Path -LiteralPath $SettingsPath) {
         try {
-            $loaded = (Get-Content -LiteralPath $SettingsPath -Raw) | ConvertFrom-Json
+            $loaded = Read-Utf8JsonFile -Path $SettingsPath
             foreach ($name in @('auto_update_enabled', 'auto_update_interval_min', 'autostart_enabled', 'keep_background_on_close')) {
                 if ($loaded.PSObject.Properties[$name]) {
                     $settings[$name] = $loaded.$name
@@ -309,7 +390,7 @@ function Get-State {
     }
 
     try {
-        $loaded = (Get-Content -LiteralPath $StatePath -Raw) | ConvertFrom-Json
+        $loaded = Read-Utf8JsonFile -Path $StatePath
         $state = @{}
         foreach ($property in $loaded.PSObject.Properties) {
             $state[$property.Name] = $property.Value
@@ -323,7 +404,205 @@ function Get-State {
 
 function Save-State {
     param([hashtable]$State)
-    Write-Utf8BomFile -Path $StatePath -Content (([pscustomobject]$State) | ConvertTo-Json -Depth 10)
+    Write-Utf8BomFile -Path $StatePath -Content (ConvertTo-ReadableJson -InputObject ([pscustomobject]$State))
+}
+
+function Get-DefaultRemoteConfig {
+    $currentVersion = Get-AppVersion
+
+    return @{
+        type            = 'none'
+        latest_version  = $currentVersion
+        message         = ''
+        disable_fix     = $false
+    }
+}
+
+function Save-RemoteConfig {
+    param([hashtable]$RemoteConfig)
+    Write-Utf8BomFile -Path $RemoteConfigPath -Content (ConvertTo-ReadableJson -InputObject ([pscustomobject]$RemoteConfig))
+}
+
+function Get-RemoteConfig {
+    $remoteConfig = Get-DefaultRemoteConfig
+    $needsSave = $false
+
+    if (Test-Path -LiteralPath $RemoteConfigPath) {
+        try {
+            $loaded = Read-Utf8JsonFile -Path $RemoteConfigPath
+            $remoteConfig = ConvertTo-RemoteConfigHashtable -RemoteConfig $loaded
+        }
+        catch {
+            $needsSave = $true
+        }
+    }
+    else {
+        $needsSave = $true
+    }
+
+    if ($null -eq $remoteConfig['message']) {
+        $remoteConfig['message'] = ''
+        $needsSave = $true
+    }
+
+    if ($needsSave) {
+        Save-RemoteConfig -RemoteConfig $remoteConfig
+    }
+
+    return [pscustomobject]$remoteConfig
+}
+
+function ConvertTo-VersionObject {
+    param([string]$Value)
+
+    if ([string]::IsNullOrWhiteSpace($Value)) {
+        return $null
+    }
+
+    try {
+        return [version]$Value
+    }
+    catch {
+        return $null
+    }
+}
+
+function Compare-AppVersions {
+    param(
+        [string]$LeftVersion,
+        [string]$RightVersion
+    )
+
+    $left = ConvertTo-VersionObject -Value $LeftVersion
+    $right = ConvertTo-VersionObject -Value $RightVersion
+    if ($null -eq $left -or $null -eq $right) {
+        return 0
+    }
+
+    return $left.CompareTo($right)
+}
+
+function ConvertTo-RemoteConfigHashtable {
+    param([object]$RemoteConfig)
+
+    $defaults = Get-DefaultRemoteConfig
+    $normalized = [ordered]@{}
+
+    if ($null -ne $RemoteConfig) {
+        if ($RemoteConfig -is [System.Collections.IDictionary]) {
+            foreach ($key in $RemoteConfig.Keys) {
+                $normalized[[string]$key] = $RemoteConfig[$key]
+            }
+        }
+        else {
+            foreach ($property in $RemoteConfig.PSObject.Properties) {
+                $normalized[$property.Name] = $property.Value
+            }
+        }
+    }
+
+    if (-not $normalized.Contains('type')) {
+        $normalized['type'] = [string]$defaults.type
+    }
+    if (-not $normalized.Contains('latest_version')) {
+        $normalized['latest_version'] = [string]$defaults.latest_version
+    }
+    if (-not $normalized.Contains('message')) {
+        $normalized['message'] = [string]$defaults.message
+    }
+    if (-not $normalized.Contains('disable_fix')) {
+        $normalized['disable_fix'] = [bool]$defaults.disable_fix
+    }
+
+    $normalized['type'] = [string]$normalized['type']
+    $normalized['latest_version'] = [string]$normalized['latest_version']
+    $normalized['message'] = [string]$normalized['message']
+    $normalized['disable_fix'] = [bool]$normalized['disable_fix']
+
+    if ([string]::IsNullOrWhiteSpace($normalized['latest_version'])) {
+        $normalized['latest_version'] = Get-AppVersion
+    }
+
+    if ($null -eq $normalized['message']) {
+        $normalized['message'] = ''
+    }
+
+    return $normalized
+}
+
+function Get-RemoteConfigDownloadUrl {
+    param([object]$RemoteConfig)
+
+    if ($null -eq $RemoteConfig) {
+        return Get-DefaultDownloadPageUrl
+    }
+
+    if ($RemoteConfig -is [System.Collections.IDictionary]) {
+        if ($RemoteConfig.Contains('download_url') -and -not [string]::IsNullOrWhiteSpace([string]$RemoteConfig['download_url'])) {
+            return [string]$RemoteConfig['download_url']
+        }
+    }
+    elseif ($RemoteConfig.PSObject.Properties['download_url'] -and -not [string]::IsNullOrWhiteSpace([string]$RemoteConfig.download_url)) {
+        return [string]$RemoteConfig.download_url
+    }
+
+    return Get-DefaultDownloadPageUrl
+}
+
+function Test-UiSessionActive {
+    $state = Get-State
+    if (-not $state.ContainsKey('ui_session_active') -or [string]$state.ui_session_active -ne 'true') {
+        return $false
+    }
+
+    if (-not $state.ContainsKey('ui_pid') -or [string]::IsNullOrWhiteSpace([string]$state.ui_pid)) {
+        return $false
+    }
+
+    try {
+        $pidValue = [int]$state.ui_pid
+        $process = Get-Process -Id $pidValue -ErrorAction Stop
+        return ($null -ne $process)
+    }
+    catch {
+        Update-State -Values @{ ui_session_active = 'false'; ui_pid = '' }
+        return $false
+    }
+}
+
+function Test-UpdatePromptDismissed {
+    param([object]$RemoteConfig)
+
+    $config = ConvertTo-RemoteConfigHashtable -RemoteConfig $RemoteConfig
+    $state = Get-State
+    $currentKey = ('{0}|{1}|{2}' -f [string]$config['latest_version'], [string]$config['message'], [string]$config['type'])
+    $dismissedKey = [string]$(if ($state.ContainsKey('dismissed_update_prompt_key')) { $state.dismissed_update_prompt_key } else { '' })
+    return ($currentKey -eq $dismissedKey)
+}
+
+function Dismiss-UpdatePrompt {
+    param([object]$RemoteConfig)
+
+    $config = ConvertTo-RemoteConfigHashtable -RemoteConfig $RemoteConfig
+    Update-State -Values @{ dismissed_update_prompt_key = ('{0}|{1}|{2}' -f [string]$config['latest_version'], [string]$config['message'], [string]$config['type']) }
+}
+
+function Test-RemoteConfigChanged {
+    param(
+        [object]$Left,
+        [object]$Right
+    )
+
+    $leftConfig = ConvertTo-RemoteConfigHashtable -RemoteConfig $Left
+    $rightConfig = ConvertTo-RemoteConfigHashtable -RemoteConfig $Right
+
+    foreach ($name in @('type', 'latest_version', 'message', 'disable_fix', 'download_url')) {
+        if ([string]$leftConfig[$name] -ne [string]$rightConfig[$name]) {
+            return $true
+        }
+    }
+
+    return $false
 }
 
 function Update-State {
@@ -700,6 +979,8 @@ function Invoke-UiShutdown {
     }
 
     $script:UiShutdownHandled = $true
+    Save-ConsoleWindowPlacement
+    Update-State -Values @{ ui_session_active = 'false'; ui_pid = '' }
     $settings = Get-Settings
 
     if ([bool]$settings.keep_background_on_close) {
@@ -820,7 +1101,7 @@ function Test-ConfigNeedsPatch {
     if (-not (Test-Path -LiteralPath $ConfigPath)) { return $false }
 
     try {
-        $config = (Get-Content -LiteralPath $ConfigPath -Raw) | ConvertFrom-Json
+        $config = Read-Utf8JsonFile -Path $ConfigPath
     }
     catch {
         return $true
@@ -936,6 +1217,107 @@ function Test-RulesNeedUpdate {
     return (((Get-Date) - $lastUpdate).TotalMinutes -ge [int]$settings.auto_update_interval_min)
 }
 
+function Test-RemoteConfigNeedsSync {
+    $settings = Get-Settings
+    if (-not [bool]$settings.auto_update_enabled) { return $false }
+
+    $url = Get-RemoteConfigUrl
+    if ([string]::IsNullOrWhiteSpace($url)) { return $false }
+
+    $state = Get-State
+    $hasStartupCheck = ($state.ContainsKey('remote_config_boot_check_pending') -and [string]$state.remote_config_boot_check_pending -eq 'true')
+    $hasUiSession = Test-UiSessionActive
+    if (-not $hasStartupCheck -and -not $hasUiSession) {
+        return $false
+    }
+
+    if ($hasStartupCheck) {
+        return $true
+    }
+
+    if ($state.ContainsKey('next_remote_config_retry_at') -and -not [string]::IsNullOrWhiteSpace([string]$state.next_remote_config_retry_at)) {
+        try {
+            $retryAt = [datetime]::Parse([string]$state.next_remote_config_retry_at)
+            if ((Get-Date) -lt $retryAt) { return $false }
+        }
+        catch {
+        }
+    }
+
+    if (-not $state.ContainsKey('last_remote_config_sync_at') -or [string]::IsNullOrWhiteSpace([string]$state.last_remote_config_sync_at)) {
+        return $true
+    }
+
+    try {
+        $lastSyncAt = [datetime]::Parse([string]$state.last_remote_config_sync_at)
+    }
+    catch {
+        return $true
+    }
+
+    return (((Get-Date) - $lastSyncAt).TotalMinutes -ge [int]$settings.auto_update_interval_min)
+}
+
+function Invoke-RemoteConfigSync {
+    $url = Get-RemoteConfigUrl
+    if ([string]::IsNullOrWhiteSpace($url)) {
+        throw 'Не задан remote_config_url в serv/happ-routing-app.json.'
+    }
+
+    $tempPath = [System.IO.Path]::GetTempFileName()
+    try {
+        Invoke-WebRequest -Uri $url -OutFile $tempPath
+
+        $serverConfig = Read-Utf8JsonFile -Path $tempPath
+        $serverConfigData = ConvertTo-RemoteConfigHashtable -RemoteConfig $serverConfig
+        $localConfig = Get-RemoteConfig
+        $changed = Test-RemoteConfigChanged -Left $localConfig -Right $serverConfigData
+
+        Save-RemoteConfig -RemoteConfig $serverConfigData
+        Update-State -Values @{
+            last_remote_config_sync_at = (Get-Date).ToString('s')
+            next_remote_config_retry_at = ''
+            remote_config_boot_check_pending = 'false'
+        }
+
+        if ($changed) {
+            Update-State -Values @{ last_remote_config_change_at = (Get-Date).ToString('s') }
+            Request-UiFlash
+            Write-AppLog ('Remote config обновлен: type={0}, latest_version={1}' -f $serverConfigData.type, $serverConfigData.latest_version)
+        }
+
+        return $changed
+    }
+    finally {
+        if (Test-Path -LiteralPath $tempPath) {
+            try {
+                Remove-Item -LiteralPath $tempPath -Force -ErrorAction Stop
+            }
+            catch {
+            }
+        }
+    }
+}
+
+function Invoke-RemoteConfigSyncManual {
+    try {
+        $changed = Invoke-RemoteConfigSync
+        if ($changed) {
+            Update-State -Values @{ status = 'обновления синхронизированы' }
+        }
+        else {
+            Update-State -Values @{ status = 'обновления не найдены' }
+        }
+    }
+    catch {
+        Update-State -Values @{
+            status             = 'ошибка проверки обновлений'
+            last_error_message = $_.Exception.Message
+        }
+        Write-AppLogLimited -Key ('remote-config-manual:' + $_.Exception.Message) -Message ('Ручная проверка обновлений завершилась ошибкой: ' + $_.Exception.Message)
+    }
+}
+
 function Format-RuDate {
     param([string]$Value)
 
@@ -984,9 +1366,93 @@ function Initialize-Console {
     [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
     [Console]::TreatControlCAsInput = $true
     $Host.UI.RawUI.WindowTitle = $UiWindowTitle
+
+    if (-not ('HappRoutingFixConsoleApi' -as [type])) {
+        Add-Type @'
+using System;
+using System.Runtime.InteropServices;
+public struct RECT {
+    public int Left;
+    public int Top;
+    public int Right;
+    public int Bottom;
+}
+public class HappRoutingFixConsoleApi {
+    [DllImport("kernel32.dll")]
+    public static extern IntPtr GetConsoleWindow();
+
+    [DllImport("user32.dll")]
+    public static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
+
+    [DllImport("user32.dll")]
+    public static extern bool MoveWindow(IntPtr hWnd, int X, int Y, int nWidth, int nHeight, bool bRepaint);
+
+    [DllImport("user32.dll")]
+    public static extern bool IsWindowVisible(IntPtr hWnd);
+}
+'@
+    }
 }
 
 $script:UiToggleLine = -1
+
+function Save-ConsoleWindowPlacement {
+    try {
+        $handle = [HappRoutingFixConsoleApi]::GetConsoleWindow()
+        if ($handle -eq [IntPtr]::Zero) {
+            return
+        }
+
+        $rect = New-Object RECT
+        if (-not [HappRoutingFixConsoleApi]::GetWindowRect($handle, [ref]$rect)) {
+            return
+        }
+
+        $width = [Math]::Max(0, $rect.Right - $rect.Left)
+        $height = [Math]::Max(0, $rect.Bottom - $rect.Top)
+        if ($width -le 0 -or $height -le 0) {
+            return
+        }
+
+        Update-State -Values @{
+            ui_window_left   = [string]$rect.Left
+            ui_window_top    = [string]$rect.Top
+            ui_window_width  = [string]$width
+            ui_window_height = [string]$height
+        }
+    }
+    catch {
+    }
+}
+
+function Restore-ConsoleWindowPlacement {
+    $state = Get-State
+    $required = @('ui_window_left', 'ui_window_top', 'ui_window_width', 'ui_window_height')
+    foreach ($name in $required) {
+        if (-not $state.ContainsKey($name) -or [string]::IsNullOrWhiteSpace([string]$state[$name])) {
+            return
+        }
+    }
+
+    try {
+        $left = [int]$state.ui_window_left
+        $top = [int]$state.ui_window_top
+        $width = [int]$state.ui_window_width
+        $height = [int]$state.ui_window_height
+        if ($width -lt 320 -or $height -lt 200) {
+            return
+        }
+
+        $handle = [HappRoutingFixConsoleApi]::GetConsoleWindow()
+        if ($handle -eq [IntPtr]::Zero) {
+            return
+        }
+
+        [HappRoutingFixConsoleApi]::MoveWindow($handle, $left, $top, $width, $height, $true) | Out-Null
+    }
+    catch {
+    }
+}
 
 function Activate-UiWindow {
     $activated = $false
@@ -1119,6 +1585,8 @@ function Read-ProcessMonitorKey {
 
 function Get-UiDisplayData {
     $status = Get-StatusObject
+    $appVersion = Get-AppVersion
+    $remoteConfig = Get-RemoteConfig
     $statusText = 'НЕ ЗАПУЩЕНО'
     $statusColor = 'DarkRed'
     if ($status.running) {
@@ -1140,8 +1608,53 @@ function Get-UiDisplayData {
     if ($f2Text -eq 'вкл') { $f2Color = 'Magenta' }
     if ($f3Text -eq 'выкл') { $f3Color = 'DarkGray' }
 
+    $remoteMessageText = '-'
+    $remoteMessageColor = 'DarkGray'
+    $remoteMessageRaw = [string]$remoteConfig.message
+    if (-not [string]::IsNullOrWhiteSpace($remoteMessageRaw)) {
+        $remoteMessageText = $remoteMessageRaw.Trim()
+    }
+
+    $remoteType = [string]$remoteConfig.type
+    $latestVersion = [string]$remoteConfig.latest_version
+    $versionCompare = Compare-AppVersions -LeftVersion $appVersion -RightVersion $latestVersion
+    $shouldShowUpdate = ($remoteType -eq 'update' -and $versionCompare -lt 0)
+    $shouldShowNews = (($remoteType -eq 'news' -or $remoteType -eq 'new') -and -not [string]::IsNullOrWhiteSpace($remoteMessageRaw))
+    $disableFix = [bool]$remoteConfig.disable_fix
+    $updatePromptVisible = $false
+    $updateDownloadUrl = Get-RemoteConfigDownloadUrl -RemoteConfig $remoteConfig
+
+    if ($shouldShowUpdate) {
+        $remoteMessageColor = 'Red'
+        if ([string]::IsNullOrWhiteSpace($remoteMessageRaw)) {
+            $remoteMessageText = ('Доступна новая версия: {0}' -f $latestVersion)
+        }
+        if (-not (Test-UpdatePromptDismissed -RemoteConfig $remoteConfig)) {
+            $updatePromptVisible = $true
+        }
+    }
+    elseif ($shouldShowNews) {
+        $remoteMessageColor = 'DarkGray'
+    }
+    else {
+        $remoteMessageText = '-'
+        $remoteMessageColor = 'DarkGray'
+    }
+
+    if ($disableFix) {
+        $statusText = 'ОТКЛЮЧЕН УДАЛЕННО'
+        $statusColor = 'DarkRed'
+        $updatePromptVisible = $false
+        if ($remoteMessageText -eq '-') {
+            $remoteMessageText = 'Фикс временно отключен разработчиком'
+        }
+        $remoteMessageColor = 'Red'
+    }
+
     return [pscustomobject]@{
         status = $status
+        remote_config = $remoteConfig
+        app_version = $appVersion
         status_text = $statusText
         status_color = $statusColor
         f1_text = $f1Text
@@ -1150,6 +1663,26 @@ function Get-UiDisplayData {
         f1_color = $f1Color
         f2_color = $f2Color
         f3_color = $f3Color
+        remote_message_text = $remoteMessageText
+        remote_message_color = $remoteMessageColor
+        update_prompt_visible = $updatePromptVisible
+        update_download_url = $updateDownloadUrl
+        disable_fix = $disableFix
+    }
+}
+
+function Open-UpdateDownloadPage {
+    param([string]$Url)
+
+    if ([string]::IsNullOrWhiteSpace($Url)) {
+        return
+    }
+
+    try {
+        Start-Process -FilePath $Url | Out-Null
+    }
+    catch {
+        Write-AppLogLimited -Key ('update-page-open:' + $_.Exception.Message) -Message ('Не удалось открыть страницу обновления: ' + $_.Exception.Message)
     }
 }
 
@@ -1189,6 +1722,12 @@ function Render-UiScreen {
     Write-Host '[4] Запустить чекер процессов' -ForegroundColor Gray
     Write-Host '[5] Открыть Telegram разработчика' -ForegroundColor DarkGray
     Write-Host '[Esc] Выход' -ForegroundColor DarkGray
+    Write-Host ''
+    Write-Host '[6] Обновления: ' -ForegroundColor White -NoNewline
+    Write-Host $DisplayData.remote_message_text -ForegroundColor $DisplayData.remote_message_color
+    if ($DisplayData.update_prompt_visible) {
+        Write-Host 'Y Скачать обновление    N Скрыть это предложение' -ForegroundColor DarkYellow
+    }
     Write-Host ''
 
     $f1Color = $DisplayData.f1_color
@@ -1292,10 +1831,22 @@ function Handle-UiKey {
     param([object]$KeyInfo)
 
     $key = $KeyInfo.VirtualKeyCode
+    $display = Get-UiDisplayData
 
     if ($key -eq 27) {
         $script:UiExitRequested = $true
         return $false
+    }
+
+    if ($display.update_prompt_visible -and ($key -eq 89)) {
+        Dismiss-UpdatePrompt -RemoteConfig $display.remote_config
+        Open-UpdateDownloadPage -Url ([string]$display.update_download_url)
+        return $true
+    }
+
+    if ($display.update_prompt_visible -and ($key -eq 78)) {
+        Dismiss-UpdatePrompt -RemoteConfig $display.remote_config
+        return $true
     }
 
     if ($key -eq 112) {
@@ -1357,11 +1908,17 @@ function Handle-UiKey {
         return $true
     }
 
+    if ($key -eq 54 -or $key -eq 102) {
+        Invoke-RemoteConfigSyncManual
+        return $true
+    }
+
     return $true
 }
 
 function Start-UiLoop {
     Initialize-Console
+    Restore-ConsoleWindowPlacement
 
     $uiMutexCreated = $false
     $uiMutex = New-Object System.Threading.Mutex($true, 'Local\HappRoutingUiByGulenok91', [ref]$uiMutexCreated)
@@ -1373,6 +1930,10 @@ function Start-UiLoop {
     }
 
     try {
+        Update-State -Values @{
+            ui_session_active = 'true'
+            ui_pid            = [string]$PID
+        }
         $settings = Get-Settings
         $null = Set-AutostartEntry -Enabled ([bool]$settings.autostart_enabled)
         if (Get-DesiredRunning) {
@@ -1447,6 +2008,38 @@ function Start-AgentLoop {
             if ([bool]$settings.autostart_enabled -and (((Get-Date) - $lastAutostartSyncAt).TotalSeconds -ge 30)) {
                 $null = Set-AutostartEntry -Enabled $true
                 $lastAutostartSyncAt = Get-Date
+            }
+
+            if (Test-RemoteConfigNeedsSync) {
+                try {
+                    $remoteConfigChanged = Invoke-RemoteConfigSync
+                    if ($remoteConfigChanged) {
+                        Update-State -Values @{ status = 'обновления синхронизированы' }
+                        $lastMode = 'remote config updated'
+                    }
+                }
+                catch {
+                    Update-State -Values @{
+                        status                      = 'ошибка синхронизации обновлений'
+                        last_error_message          = $_.Exception.Message
+                        remote_config_boot_check_pending = 'false'
+                        next_remote_config_retry_at = (Get-Date).AddMinutes(5).ToString('s')
+                    }
+                    if ($lastMode -ne 'remote config failed') {
+                        Write-AppLogLimited -Key ('remote-config:' + $_.Exception.Message) -Message ('Синхронизация remote config завершилась ошибкой: ' + $_.Exception.Message)
+                    }
+                    $lastMode = 'remote config failed'
+                    Start-Sleep -Seconds 1
+                    continue
+                }
+            }
+
+            $remoteConfig = Get-RemoteConfig
+            if ([bool]$remoteConfig.disable_fix) {
+                Update-State -Values @{ status = 'фикс отключен разработчиком' }
+                $lastMode = 'remote disabled'
+                Start-Sleep -Milliseconds 250
+                continue
             }
 
             if (Test-RulesNeedUpdate) {
@@ -1569,6 +2162,7 @@ switch ($Action) {
 
     'start-agent-if-enabled' {
         if (Get-DesiredRunning) {
+            Update-State -Values @{ remote_config_boot_check_pending = 'true' }
             [pscustomobject]@{ ok = $true; started = $true; pid = (Start-AgentProcess -SetDesired $false) } | ConvertTo-Json -Depth 10
         }
         else {
