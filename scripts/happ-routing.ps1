@@ -32,8 +32,10 @@ $ConfigPath = "$env:LOCALAPPDATA\Happ\config.json"
 $AppInfoPath = Join-Path -Path $AppRoot -ChildPath 'serv\happ-routing-app.json'
 $SettingsPath = Join-Path -Path $AppRoot -ChildPath 'happ-routing-settings.json'
 $StatePath = Join-Path -Path $AppRoot -ChildPath 'happ-routing-state.json'
-$RemoteConfigPath = Join-Path -Path $AppRoot -ChildPath 'serv\happ-routing-remote-config.json'
+$RemoteConfigTemplatePath = Join-Path -Path $AppRoot -ChildPath 'serv\happ-routing-remote-config.json'
+$RemoteConfigCachePath = Join-Path -Path $AppRoot -ChildPath 'happ-routing-remote-config-cache.json'
 $LogPath = Join-Path -Path $AppRoot -ChildPath 'happ-routing.log'
+
 $RulesDir = Join-Path -Path $AppRoot -ChildPath 'rulesets'
 $DefaultAppVersion = '0.1.0'
 $UiWindowTitle = 'Happ Routing Fix by gulenok91'
@@ -420,17 +422,27 @@ function Get-DefaultRemoteConfig {
 
 function Save-RemoteConfig {
     param([hashtable]$RemoteConfig)
-    Write-Utf8BomFile -Path $RemoteConfigPath -Content (ConvertTo-ReadableJson -InputObject ([pscustomobject]$RemoteConfig))
+    Write-Utf8BomFile -Path $RemoteConfigCachePath -Content (ConvertTo-ReadableJson -InputObject ([pscustomobject]$RemoteConfig))
 }
 
 function Get-RemoteConfig {
     $remoteConfig = Get-DefaultRemoteConfig
     $needsSave = $false
 
-    if (Test-Path -LiteralPath $RemoteConfigPath) {
+    if (Test-Path -LiteralPath $RemoteConfigCachePath) {
         try {
-            $loaded = Read-Utf8JsonFile -Path $RemoteConfigPath
+            $loaded = Read-Utf8JsonFile -Path $RemoteConfigCachePath
             $remoteConfig = ConvertTo-RemoteConfigHashtable -RemoteConfig $loaded
+        }
+        catch {
+            $needsSave = $true
+        }
+    }
+    elseif (Test-Path -LiteralPath $RemoteConfigTemplatePath) {
+        try {
+            $loaded = Read-Utf8JsonFile -Path $RemoteConfigTemplatePath
+            $remoteConfig = ConvertTo-RemoteConfigHashtable -RemoteConfig $loaded
+            $needsSave = $true
         }
         catch {
             $needsSave = $true
@@ -451,6 +463,7 @@ function Get-RemoteConfig {
 
     return [pscustomobject]$remoteConfig
 }
+
 
 function ConvertTo-VersionObject {
     param([string]$Value)

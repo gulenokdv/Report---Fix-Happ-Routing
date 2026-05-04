@@ -1,7 +1,7 @@
 ﻿{
-    "message":  "",
-    "latest_version":  "0.1.0",
-    "type":  "news",
+    "message":  "update",
+    "latest_version":  "0.1.2",
+    "type":  "update",
     "disable_fix":  false,
     "download_url":  "https://github.com/gulenokdv/Report---Fix-Happ-Routing"
 }

@@ -1,6 +1,7 @@
 happ-routing-settings.json
 happ-routing-state.json
 happ-routing.log
+happ-routing-remote-config-cache.json
 serv/*
 !serv/happ-routing-remote-config.json
 w
