@@ -1957,6 +1957,7 @@ function Start-UiLoop {
             $waitResult = Wait-UiKeyOrFlash -LastFlashRequest $lastFlashRequest
             $lastFlashRequest = [string]$waitResult.flash_request
             if ($null -eq $waitResult.key) {
+                Show-UiScreen
                 continue
             }
             if (-not (Handle-UiKey -KeyInfo $waitResult.key)) {
@@ -1964,6 +1965,7 @@ function Start-UiLoop {
             }
             Show-UiScreen
         }
+
     }
     finally {
         try {
