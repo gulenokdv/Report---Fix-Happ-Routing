@@ -1624,30 +1624,56 @@ function Get-UiDisplayData {
     $remoteMessageText = '-'
     $remoteMessageColor = 'DarkGray'
     $remoteMessageRaw = [string]$remoteConfig.message
-    if (-not [string]::IsNullOrWhiteSpace($remoteMessageRaw)) {
+    $remoteType = [string]$remoteConfig.type
+    $latestVersion = [string]$remoteConfig.latest_version
+    $disableFix = [bool]$remoteConfig.disable_fix
+    $updatePromptVisible = $false
+    $newsPromptVisible = $false
+
+    # Проверка dismissed announcements
+    $state = Get-State
+    $dismissedUpdateKey = 'dismissed_update_version'
+    $dismissedNewsKey = 'dismissed_news_hash'
+    
+    $currentUpdateKey = "update|$latestVersion"
+    $currentNewsHash = "news|$($remoteMessageRaw.GetHashCode())"
+    
+    $dismissedUpdateVersion = [string]$state[$dismissedUpdateKey]
+    $dismissedNewsHash = [string]$state[$dismissedNewsKey]
+    
+    # Логика отображения сообщения
+    if ([string]::IsNullOrWhiteSpace($remoteMessageRaw)) {
+        $remoteMessageText = '-'
+    }
+    else {
         $remoteMessageText = $remoteMessageRaw.Trim()
     }
 
-    $remoteType = [string]$remoteConfig.type
-    $latestVersion = [string]$remoteConfig.latest_version
-    $versionCompare = Compare-AppVersions -LeftVersion $appVersion -RightVersion $latestVersion
-    $shouldShowUpdate = ($remoteType -eq 'update' -and $versionCompare -lt 0)
-    $shouldShowNews = (($remoteType -eq 'news' -or $remoteType -eq 'new') -and -not [string]::IsNullOrWhiteSpace($remoteMessageRaw))
-    $disableFix = [bool]$remoteConfig.disable_fix
-    $updatePromptVisible = $false
-    $updateDownloadUrl = Get-RemoteConfigDownloadUrl -RemoteConfig $remoteConfig
-
-    if ($shouldShowUpdate) {
-        $remoteMessageColor = 'Red'
-        if ([string]::IsNullOrWhiteSpace($remoteMessageRaw)) {
-            $remoteMessageText = ('Доступна новая версия: {0}' -f $latestVersion)
+    # Если type=update и версия новая - показываем уведомление
+    if ($remoteType -eq 'update') {
+        $versionCompare = Compare-AppVersions -LeftVersion $appVersion -RightVersion $latestVersion
+        if ($versionCompare -lt 0) {
+            $remoteMessageColor = 'Red'
+            if ([string]::IsNullOrWhiteSpace($remoteMessageText) -or $remoteMessageText -eq '-') {
+                $remoteMessageText = ('Доступна новая версия: {0}' -f $latestVersion)
+            }
+            # Показываем если не скрыто для этой версии
+            if ($dismissedUpdateVersion -ne $latestVersion) {
+                $updatePromptVisible = $true
+            }
         }
-        if (-not (Test-UpdatePromptDismissed -RemoteConfig $remoteConfig)) {
-            $updatePromptVisible = $true
+        else {
+            # Версии совпадают или локальная новее - показываем прочерк
+            $remoteMessageText = '-'
+            $remoteMessageColor = 'DarkGray'
         }
     }
-    elseif ($shouldShowNews) {
+    elseif ($remoteType -eq 'news' -or $remoteType -eq 'new') {
         $remoteMessageColor = 'DarkGray'
+        # Показываем если не скрыто навсегда
+        if ($dismissedNewsHash -ne $currentNewsHash) {
+            $newsPromptVisible = $true
+        }
     }
     else {
         $remoteMessageText = '-'
@@ -1657,11 +1683,12 @@ function Get-UiDisplayData {
     if ($disableFix) {
         $statusText = 'ОТКЛЮЧЕН УДАЛЕННО'
         $statusColor = 'DarkRed'
-        $updatePromptVisible = $false
         if ($remoteMessageText -eq '-') {
             $remoteMessageText = 'Фикс временно отключен разработчиком'
         }
         $remoteMessageColor = 'Red'
+        $updatePromptVisible = $false
+        $newsPromptVisible = $false
     }
 
     return [pscustomobject]@{
@@ -1678,9 +1705,11 @@ function Get-UiDisplayData {
         f3_color = $f3Color
         remote_message_text = $remoteMessageText
         remote_message_color = $remoteMessageColor
-        update_prompt_visible = $updatePromptVisible
-        update_download_url = $updateDownloadUrl
         disable_fix = $disableFix
+        update_prompt_visible = $updatePromptVisible
+        news_prompt_visible = $newsPromptVisible
+        current_update_key = $currentUpdateKey
+        current_news_hash = $currentNewsHash
     }
 }
 
@@ -1696,161 +1725,6 @@ function Open-UpdateDownloadPage {
     }
     catch {
         Write-AppLogLimited -Key ('update-page-open:' + $_.Exception.Message) -Message ('Не удалось открыть страницу обновления: ' + $_.Exception.Message)
-    }
-}
-
-function Get-LatestReleaseAsset {
-    param(
-        [string]$RepoOwner,
-        [string]$RepoName,
-        [string]$AssetPattern
-    )
-
-    $apiUrl = "https://api.github.com/repos/$RepoOwner/$RepoName/releases/latest"
-    
-    try {
-        $headers = @{
-            'User-Agent' = 'HappRoutingFix/1.0'
-        }
-        $release = Invoke-RestMethod -Uri $apiUrl -Headers $headers -Method Get
-        
-        if ($null -eq $release -or $null -eq $release.assets) {
-            throw "Release не найден или пуст"
-        }
-
-        foreach ($asset in $release.assets) {
-            if ($asset.name -match $AssetPattern) {
-                return @{
-                    browser_download_url = $asset.browser_download_url
-                    name = $asset.name
-                    version = $release.tag_name
-                }
-            }
-        }
-
-        throw "Asset с паттерном '$AssetPattern' не найден"
-    }
-    catch {
-        throw $_.Exception.Message
-    }
-}
-
-function Test-ReleaseAssetValid {
-    param([string]$ZipPath)
-
-    try {
-        $requiredItems = @('happ-routing-fix.bat', 'scripts', 'serv')
-        
-        $tempExtract = Join-Path -Path (Get-Item $env:TEMP).FullName -ChildPath ('verify-{0}' -f [Guid]::NewGuid().ToString('N'))
-        New-Item -ItemType Directory -Force -Path $tempExtract | Out-Null
-        
-        try {
-            Add-Type -AssemblyName System.IO.Compression.FileSystem
-            $zip = [System.IO.Compression.ZipFile]::OpenRead($ZipPath)
-            
-            $found = @{}
-            foreach ($entry in $zip.Entries) {
-                $name = $entry.Name.ToLowerInvariant()
-                if ($name -eq 'happ-routing-fix.bat') { $found['bat'] = $true }
-                if ($name -eq 'happ-routing.ps1') { $found['ps1'] = $true }
-                if ($entry.FullName.ToLowerInvariant().StartsWith('serv/')) { $found['serv'] = $true }
-                if ($entry.FullName.ToLowerInvariant().StartsWith('scripts/')) { $found['scripts'] = $true }
-            }
-            $zip.Dispose()
-            
-            return ($found['bat'] -and $found['ps1'] -and $found['serv'] -and $found['scripts'])
-        }
-        finally {
-            if (Test-Path -LiteralPath $tempExtract) {
-                Remove-Item -LiteralPath $tempExtract -Recurse -Force -ErrorAction SilentlyContinue
-            }
-        }
-    }
-    catch {
-        return $false
-    }
-}
-
-function Start-SelfUpdate {
-    try {
-        Write-AppLog 'Начало автообновления...'
-
-        # 1. Получить информацию о latest release
-        $releaseInfo = Get-LatestReleaseAsset -RepoOwner 'gulenokdv' -RepoName 'Report---Fix-Happ-Routing' -AssetPattern 'Report-Happ-routing-fix\.zip'
-        
-        Write-AppLog ("Найдена версия: {0}, файл: {1}" -f $releaseInfo.version, $releaseInfo.name)
-
-        # 2. Скачать zip во временную папку
-        $tempDir = Join-Path -Path (Get-Item $env:TEMP).FullName -ChildPath ('happ-update-{0}' -f [Guid]::NewGuid().ToString('N'))
-        New-Item -ItemType Directory -Force -Path $tempDir | Out-Null
-        
-        $zipPath = Join-Path -Path $tempDir -ChildPath $releaseInfo.name
-        $extractPath = Join-Path -Path $tempDir -ChildPath 'staging'
-
-        try {
-            Write-AppLog 'Скачивание релиза...'
-            Invoke-WebRequest -Uri $releaseInfo.browser_download_url -OutFile $zipPath
-            
-            # 3. Проверить валидность zip
-            Write-AppLog 'Проверка архива...'
-            if (-not (Test-ReleaseAssetValid -ZipPath $zipPath)) {
-                throw "Архив не валиден: отсутствуют обязательные файлы"
-            }
-
-            # 4. Распаковать
-            Write-AppLog 'Распаковка...'
-            Add-Type -AssemblyName System.IO.Compression.FileSystem
-            [System.IO.Compression.ZipFile]::ExtractToDirectory($zipPath, $extractPath)
-
-            # 5. Найти папку с файлами (может быть вложенной)
-            $actualStaging = $extractPath
-            $items = Get-ChildItem -Path $extractPath -Directory
-            if ($items.Count -eq 1) {
-                $actualStaging = $items[0].FullName
-            }
-
-            # 6. Подготовить updater
-            $updaterSrc = Join-Path -Path $ScriptRoot -ChildPath 'happ-routing-updater.ps1'
-            if (-not (Test-Path -LiteralPath $updaterSrc)) {
-                throw "Updater не найден: $updaterSrc"
-            }
-            
-            $updaterTemp = Join-Path -Path $tempDir -ChildPath 'updater.ps1'
-            Copy-Item -Path $updaterSrc -Destination $updaterTemp -Force
-
-            # 7. Записать update-state
-            $updateStatePath = Join-Path -Path $AppRoot -ChildPath 'serv\update-state.json'
-            $state = @{
-                started_at = (Get-Date).ToString('o')
-                target_version = $releaseInfo.version
-                staging_path = $actualStaging
-                install_path = $AppRoot
-                status = 'downloading'
-            }
-            Set-Content -LiteralPath $updateStatePath -Value ($state | ConvertTo-Json -Depth 10) -Encoding UTF8
-
-            # 8. Запустить updater
-            Write-AppLog 'Запуск updater...'
-            $uiPid = [string](Get-AppInfo).ui_pid
-            $argumentLine = ('-NoLogo -NoProfile -ExecutionPolicy Bypass -File "{0}" -StagingPath "{1}" -InstallPath "{2}" -CurrentVersion "{3}" -UiPid "{4}"' -f `
-                $updaterTemp, $actualStaging, $AppRoot, $releaseInfo.version, $uiPid)
-            
-            Start-Process -FilePath 'powershell.exe' -ArgumentList $argumentLine -WindowStyle Normal
-            
-            # 9. Выйти из текущей консоли
-            Write-AppLog 'Обновление запущено. Закрытие текущей консоли...'
-            exit 0
-        }
-        catch {
-            if (Test-Path -LiteralPath $tempDir) {
-                Remove-Item -LiteralPath $tempDir -Recurse -Force -ErrorAction SilentlyContinue
-            }
-            throw
-        }
-    }
-    catch {
-        Write-AppLogLimited -Key 'self-update-error' -Message ('Ошибка автообновления: ' + $_.Exception.Message)
-        Update-State -Values @{ status = 'ошибка обновления'; last_error_message = $_.Exception.Message }
     }
 }
 
@@ -1891,10 +1765,13 @@ function Render-UiScreen {
     Write-Host '[5] Открыть Telegram разработчика' -ForegroundColor DarkGray
     Write-Host '[Esc] Выход' -ForegroundColor DarkGray
     Write-Host ''
-    Write-Host '[6] Обновления: ' -ForegroundColor White -NoNewline
+    Write-Host '[6] Объявления: ' -ForegroundColor White -NoNewline
     Write-Host $DisplayData.remote_message_text -ForegroundColor $DisplayData.remote_message_color
     if ($DisplayData.update_prompt_visible) {
-        Write-Host 'Y Скачать обновление    N Скрыть это предложение' -ForegroundColor DarkYellow
+        Write-Host 'Y Репозиторий    N Скрыть' -ForegroundColor DarkYellow
+    }
+    elseif ($DisplayData.news_prompt_visible) {
+        Write-Host 'N Скрыть' -ForegroundColor DarkYellow
     }
     Write-Host ''
 
@@ -1995,6 +1872,74 @@ function Wait-UiKeyOrFlash {
     }
 }
 
+function Start-UiLoop {
+    Initialize-Console
+    Restore-ConsoleWindowPlacement
+
+    $uiMutexCreated = $false
+    $uiMutex = New-Object System.Threading.Mutex($true, 'Local\HappRoutingUiByGulenok91', [ref]$uiMutexCreated)
+
+    if (-not $uiMutexCreated) {
+        Request-UiFlash
+        $null = Activate-UiWindow
+        return
+    }
+
+    try {
+        Update-State -Values @{
+            ui_session_active = 'true'
+            ui_pid            = [string]$PID
+        }
+        $settings = Get-Settings
+        $null = Set-AutostartEntry -Enabled ([bool]$settings.autostart_enabled)
+        if (Get-DesiredRunning) {
+            $null = Start-AgentProcess -SetDesired $false
+        }
+        Start-UiCloseWatcher
+        Request-UiFlash
+        $lastFlashRequest = ''
+        $processExitHandler = [System.EventHandler]{
+            param($sender, $args)
+            try {
+                Invoke-UiShutdown -ShowBackgroundNotice (-not $script:UiExitRequested)
+            }
+            catch {
+            }
+        }
+        [System.AppDomain]::CurrentDomain.add_ProcessExit($processExitHandler)
+
+        Show-UiScreen
+        while ($true) {
+            $waitResult = Wait-UiKeyOrFlash -LastFlashRequest $lastFlashRequest
+            $lastFlashRequest = [string]$waitResult.flash_request
+            if ($null -eq $waitResult.key) {
+                Show-UiScreen
+                continue
+            }
+            if (-not (Handle-UiKey -KeyInfo $waitResult.key)) {
+                break
+            }
+            Show-UiScreen
+        }
+
+    }
+    finally {
+        try {
+            Invoke-UiShutdown -ShowBackgroundNotice (-not $script:UiExitRequested)
+        }
+        catch {
+        }
+        if ($null -ne $uiMutex) {
+            try {
+                $uiMutex.ReleaseMutex() | Out-Null
+            }
+            catch {
+            }
+            $uiMutex.Dispose()
+        }
+    }
+}
+
 function Handle-UiKey {
     param([object]$KeyInfo)
 
@@ -2006,14 +1951,17 @@ function Handle-UiKey {
         return $false
     }
 
-    if ($display.update_prompt_visible -and ($key -eq 89)) {
-        Dismiss-UpdatePrompt -RemoteConfig $display.remote_config
-        Start-SelfUpdate
+    # Обработка объявлений
+    if ($display.update_prompt_visible -and ($key -eq 89)) {  # Y - репозиторий
+        Open-UpdateDownloadPage -Url 'https://github.com/gulenokdv/Report---Fix-Happ-Routing'
         return $true
     }
-
-    if ($display.update_prompt_visible -and ($key -eq 78)) {
-        Dismiss-UpdatePrompt -RemoteConfig $display.remote_config
+    if ($display.update_prompt_visible -and ($key -eq 78)) {  # N - скрыть update (до следующей версии)
+        Update-State -Values @{ dismissed_update_version = $display.remote_config.latest_version }
+        return $true
+    }
+    if ($display.news_prompt_visible -and ($key -eq 78)) {  # N - скрыть news (навсегда)
+        Update-State -Values @{ dismissed_news_hash = $display.current_news_hash }
         return $true
     }
 
@@ -2082,74 +2030,6 @@ function Handle-UiKey {
     }
 
     return $true
-}
-
-function Start-UiLoop {
-    Initialize-Console
-    Restore-ConsoleWindowPlacement
-
-    $uiMutexCreated = $false
-    $uiMutex = New-Object System.Threading.Mutex($true, 'Local\HappRoutingUiByGulenok91', [ref]$uiMutexCreated)
-
-    if (-not $uiMutexCreated) {
-        Request-UiFlash
-        $null = Activate-UiWindow
-        return
-    }
-
-    try {
-        Update-State -Values @{
-            ui_session_active = 'true'
-            ui_pid            = [string]$PID
-        }
-        $settings = Get-Settings
-        $null = Set-AutostartEntry -Enabled ([bool]$settings.autostart_enabled)
-        if (Get-DesiredRunning) {
-            $null = Start-AgentProcess -SetDesired $false
-        }
-        Start-UiCloseWatcher
-        Request-UiFlash
-        $lastFlashRequest = ''
-        $processExitHandler = [System.EventHandler]{
-            param($sender, $args)
-            try {
-                Invoke-UiShutdown -ShowBackgroundNotice (-not $script:UiExitRequested)
-            }
-            catch {
-            }
-        }
-        [System.AppDomain]::CurrentDomain.add_ProcessExit($processExitHandler)
-
-        Show-UiScreen
-        while ($true) {
-            $waitResult = Wait-UiKeyOrFlash -LastFlashRequest $lastFlashRequest
-            $lastFlashRequest = [string]$waitResult.flash_request
-            if ($null -eq $waitResult.key) {
-                Show-UiScreen
-                continue
-            }
-            if (-not (Handle-UiKey -KeyInfo $waitResult.key)) {
-                break
-            }
-            Show-UiScreen
-        }
-
-    }
-    finally {
-        try {
-            Invoke-UiShutdown -ShowBackgroundNotice (-not $script:UiExitRequested)
-        }
-        catch {
-        }
-        if ($null -ne $uiMutex) {
-            try {
-                $uiMutex.ReleaseMutex() | Out-Null
-            }
-            catch {
-            }
-            $uiMutex.Dispose()
-        }
-    }
 }
 
 function Start-AgentLoop {

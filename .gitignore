@@ -1,12 +1,10 @@
-happ-routing-settings.json
-happ-routing-state.json
-happ-routing.log
-happ-routing-remote-config-cache.json
-Report-Happ-routing-fix/
-serv/*
-!serv/happ-routing-app.json
-!serv/happ-routing-remote-config.json
-!serv/happ-routing-updater.ps1
-serv/update-state.json
+# --- Игнор конкретных файлов ---
 w
+happ-routing.log
+happ-routing-state.json
+happ-routing-settings.json
+happ-routing-remote-config-cache.json
 *.codex-backup
+
+# --- НИЧЕГО НЕ ТРОГАЕМ ---
+# (папки rulesets, scripts, serv — не игнорим)
