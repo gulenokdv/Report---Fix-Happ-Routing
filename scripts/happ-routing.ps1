@@ -32,8 +32,8 @@ $ConfigPath = "$env:LOCALAPPDATA\Happ\config.json"
 $AppInfoPath = Join-Path -Path $AppRoot -ChildPath 'serv\happ-routing-app.json'
 $SettingsPath = Join-Path -Path $AppRoot -ChildPath 'happ-routing-settings.json'
 $StatePath = Join-Path -Path $AppRoot -ChildPath 'happ-routing-state.json'
-$RemoteConfigTemplatePath = Join-Path -Path $AppRoot -ChildPath 'serv\happ-routing-remote-config.json'
-$RemoteConfigCachePath = Join-Path -Path $AppRoot -ChildPath 'happ-routing-remote-config-cache.json'
+$RemoteConfigPath = Join-Path -Path $AppRoot -ChildPath 'serv\happ-routing-remote-config.json'
+$RemoteConfigUrl = 'https://raw.githubusercontent.com/gulenokdv/Report---Fix-Happ-Routing/main/serv/happ-routing-remote-config.json'
 $LogPath = Join-Path -Path $AppRoot -ChildPath 'happ-routing.log'
 
 $RulesDir = Join-Path -Path $AppRoot -ChildPath 'rulesets'
@@ -276,7 +276,7 @@ function Remove-RunRegistryValue {
 function Get-DefaultSettings {
     return @{
         auto_update_enabled      = $true
-        auto_update_interval_min = 30
+        auto_update_interval_min = 60
         autostart_enabled        = $false
         keep_background_on_close = $true
     }
@@ -416,49 +416,26 @@ function Get-DefaultRemoteConfig {
         type            = 'none'
         latest_version  = $currentVersion
         message         = ''
+        message_url     = ''
         disable_fix     = $false
     }
 }
 
-function Save-RemoteConfig {
-    param([hashtable]$RemoteConfig)
-    Write-Utf8BomFile -Path $RemoteConfigCachePath -Content (ConvertTo-ReadableJson -InputObject ([pscustomobject]$RemoteConfig))
-}
-
 function Get-RemoteConfig {
     $remoteConfig = Get-DefaultRemoteConfig
-    $needsSave = $false
 
-    if (Test-Path -LiteralPath $RemoteConfigCachePath) {
+    if (Test-Path -LiteralPath $RemoteConfigPath) {
         try {
-            $loaded = Read-Utf8JsonFile -Path $RemoteConfigCachePath
+            $loaded = Read-Utf8JsonFile -Path $RemoteConfigPath
             $remoteConfig = ConvertTo-RemoteConfigHashtable -RemoteConfig $loaded
         }
         catch {
-            $needsSave = $true
+            # fallback to defaults
         }
-    }
-    elseif (Test-Path -LiteralPath $RemoteConfigTemplatePath) {
-        try {
-            $loaded = Read-Utf8JsonFile -Path $RemoteConfigTemplatePath
-            $remoteConfig = ConvertTo-RemoteConfigHashtable -RemoteConfig $loaded
-            $needsSave = $true
-        }
-        catch {
-            $needsSave = $true
-        }
-    }
-    else {
-        $needsSave = $true
     }
 
     if ($null -eq $remoteConfig['message']) {
         $remoteConfig['message'] = ''
-        $needsSave = $true
-    }
-
-    if ($needsSave) {
-        Save-RemoteConfig -RemoteConfig $remoteConfig
     }
 
     return [pscustomobject]$remoteConfig
@@ -526,10 +503,14 @@ function ConvertTo-RemoteConfigHashtable {
     if (-not $normalized.Contains('disable_fix')) {
         $normalized['disable_fix'] = [bool]$defaults.disable_fix
     }
+    if (-not $normalized.Contains('message_url')) {
+        $normalized['message_url'] = [string]$defaults.message_url
+    }
 
     $normalized['type'] = [string]$normalized['type']
     $normalized['latest_version'] = [string]$normalized['latest_version']
     $normalized['message'] = [string]$normalized['message']
+    $normalized['message_url'] = [string]$normalized['message_url']
     $normalized['disable_fix'] = [bool]$normalized['disable_fix']
 
     if ([string]::IsNullOrWhiteSpace($normalized['latest_version'])) {
@@ -609,7 +590,7 @@ function Test-RemoteConfigChanged {
     $leftConfig = ConvertTo-RemoteConfigHashtable -RemoteConfig $Left
     $rightConfig = ConvertTo-RemoteConfigHashtable -RemoteConfig $Right
 
-    foreach ($name in @('type', 'latest_version', 'message', 'disable_fix', 'download_url')) {
+    foreach ($name in @('type', 'latest_version', 'message', 'message_url', 'disable_fix', 'download_url')) {
         if ([string]$leftConfig[$name] -ne [string]$rightConfig[$name]) {
             return $true
         }
@@ -992,7 +973,6 @@ function Invoke-UiShutdown {
     }
 
     $script:UiShutdownHandled = $true
-    Save-ConsoleWindowPlacement
     Update-State -Values @{ ui_session_active = 'false'; ui_pid = '' }
     $settings = Get-Settings
 
@@ -1085,23 +1065,120 @@ function Wait-UiCloseAndNotify {
 }
 
 function Invoke-RulesUpdate {
-    New-Item -ItemType Directory -Force -Path $RulesDir | Out-Null
+    $oldProgress = $ProgressPreference
+    $ProgressPreference = 'SilentlyContinue'
 
-    $downloads = @(
-        @{ Name = 'geosite-vk.srs'; Url = 'https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-vk.srs' },
-        @{ Name = 'geosite-category-ru.srs'; Url = 'https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-category-ru.srs' },
-        @{ Name = 'geoip-ru.srs'; Url = 'https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-ru.srs' }
-    )
+    try {
+        New-Item -ItemType Directory -Force -Path $RulesDir | Out-Null
 
-    foreach ($download in $downloads) {
-        Invoke-WebRequest -Uri $download.Url -OutFile (Join-Path -Path $RulesDir -ChildPath $download.Name)
+        $downloads = @(
+            @{ Name = 'geosite-vk.srs'; Url = 'https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-vk.srs' },
+            @{ Name = 'geosite-category-ru.srs'; Url = 'https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-category-ru.srs' },
+            @{ Name = 'geoip-ru.srs'; Url = 'https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-ru.srs' }
+        )
+
+        $state = Get-State
+        $downloadedCount = 0
+        $unchangedCount = 0
+        $stateChanged = $false
+
+        Write-AppLog 'Начало проверки обновления rulesets...'
+
+        foreach ($download in $downloads) {
+            $fileKey = 'ruleset_etag_' + $download.Name
+            $currentEtag = ''
+            if ($state.ContainsKey($fileKey)) {
+                $currentEtag = [string]$state[$fileKey]
+            }
+
+            $serverEtag = $null
+            $headSuccess = $false
+
+            # Пробуем получить ETag через HEAD запрос
+            try {
+                $headResponse = Invoke-WebRequest -Uri $download.Url -Method Head -UseBasicParsing -TimeoutSec 30
+                if ($headResponse.Headers) {
+                    $headerDict = $headResponse.Headers
+                    if ($headerDict.ContainsKey('ETag')) {
+                        $serverEtag = [string]$headerDict['ETag']
+                    }
+                    elseif ($headerDict.ContainsKey('etag')) {
+                        $serverEtag = [string]$headerDict['etag']
+                    }
+                    elseif ($headerDict['ETag']) {
+                        $serverEtag = [string]$headerDict['ETag']
+                    }
+                }
+                $headSuccess = $true
+                Write-AppLog ('HEAD {0}: ETag={1}' -f $download.Name, $(if ($serverEtag) { $serverEtag.Substring(0, [Math]::Min(20, $serverEtag.Length)) + '...' } else { 'none' }))
+            }
+            catch {
+                Write-AppLog ('HEAD запрос не удался для {0}: {1}' -f $download.Name, $_.Exception.Message)
+            }
+
+            # Если ETag совпадает — пропускаем скачивание
+            if ($headSuccess -and $serverEtag -and $currentEtag -eq $serverEtag) {
+                $unchangedCount++
+                continue
+            }
+
+            # Скачиваем файл
+            $tempPath = [System.IO.Path]::GetTempFileName()
+            try {
+                Write-AppLog ('Скачивание {0}...' -f $download.Name)
+                Invoke-WebRequest -Uri $download.Url -OutFile $tempPath -UseBasicParsing -TimeoutSec 60 | Out-Null
+                Copy-Item -LiteralPath $tempPath -Destination (Join-Path -Path $RulesDir -ChildPath $download.Name) -Force
+
+                # Сохраняем ETag (если получили с HEAD, иначе вычисляем хеш файла)
+                if ($serverEtag) {
+                    $state[$fileKey] = $serverEtag
+                    $stateChanged = $true
+                }
+                else {
+                    try {
+                        $fileHash = (Get-FileHash -LiteralPath $tempPath -Algorithm SHA256).Hash
+                        $state[$fileKey] = $fileHash
+                        $stateChanged = $true
+                        Write-AppLog ('Сохранен хеш для {0}: {1}...' -f $download.Name, $fileHash.Substring(0, 16))
+                    }
+                    catch {
+                        Write-AppLog ('Не удалось вычислить хеш для {0}' -f $download.Name)
+                    }
+                }
+                $downloadedCount++
+            }
+            catch {
+                Remove-Item -LiteralPath $tempPath -Force -ErrorAction SilentlyContinue
+                throw ('Ошибка скачивания {0}: {1}' -f $download.Name, $_.Exception.Message)
+            }
+            finally {
+                if (Test-Path -LiteralPath $tempPath) {
+                    Remove-Item -LiteralPath $tempPath -Force -ErrorAction SilentlyContinue
+                }
+            }
+        }
+
+        # Сохраняем обновлённое state если были изменения ETag
+        if ($stateChanged) {
+            Save-State -State $state
+            Write-AppLog 'ETAG rulesets сохранены в state.'
+        }
+
+        Update-State -Values @{
+            last_rules_update_at = (Get-Date).ToString('s')
+            next_rules_retry_at  = ''
+        }
+
+        if ($downloadedCount -gt 0) {
+            Write-AppLog ('Rulesets успешно обновлены: скачано {0} из {1} файлов.' -f $downloadedCount, $downloads.Count)
+        }
+        else {
+            Write-AppLog 'Rulesets не требуют обновления (файлы актуальны).'
+        }
     }
-
-    Update-State -Values @{
-        last_rules_update_at = (Get-Date).ToString('s')
-        next_rules_retry_at  = ''
+    finally {
+        $ProgressPreference = $oldProgress
     }
-    Write-AppLog 'Rulesets успешно обновлены.'
 }
 
 function Get-ConfigStamp {
@@ -1286,17 +1363,24 @@ function Invoke-RemoteConfigSync {
         $localConfig = Get-RemoteConfig
         $changed = Test-RemoteConfigChanged -Left $localConfig -Right $serverConfigData
 
-        Save-RemoteConfig -RemoteConfig $serverConfigData
-        Update-State -Values @{
-            last_remote_config_sync_at = (Get-Date).ToString('s')
-            next_remote_config_retry_at = ''
-            remote_config_boot_check_pending = 'false'
-        }
-
         if ($changed) {
-            Update-State -Values @{ last_remote_config_change_at = (Get-Date).ToString('s') }
+            # Перезаписываем локальный remote-config файл
+            Write-Utf8BomFile -Path $RemoteConfigPath -Content (ConvertTo-ReadableJson -InputObject ([pscustomobject]$serverConfigData))
+            Update-State -Values @{
+                last_remote_config_sync_at = (Get-Date).ToString('s')
+                last_remote_config_change_at = (Get-Date).ToString('s')
+                next_remote_config_retry_at = ''
+                remote_config_boot_check_pending = 'false'
+            }
             Request-UiFlash
             Write-AppLog ('Remote config обновлен: type={0}, latest_version={1}' -f $serverConfigData.type, $serverConfigData.latest_version)
+        }
+        else {
+            Update-State -Values @{
+                last_remote_config_sync_at = (Get-Date).ToString('s')
+                next_remote_config_retry_at = ''
+                remote_config_boot_check_pending = 'false'
+            }
         }
 
         return $changed
@@ -1408,64 +1492,7 @@ public class HappRoutingFixConsoleApi {
 }
 
 $script:UiToggleLine = -1
-
-function Save-ConsoleWindowPlacement {
-    try {
-        $handle = [HappRoutingFixConsoleApi]::GetConsoleWindow()
-        if ($handle -eq [IntPtr]::Zero) {
-            return
-        }
-
-        $rect = New-Object RECT
-        if (-not [HappRoutingFixConsoleApi]::GetWindowRect($handle, [ref]$rect)) {
-            return
-        }
-
-        $width = [Math]::Max(0, $rect.Right - $rect.Left)
-        $height = [Math]::Max(0, $rect.Bottom - $rect.Top)
-        if ($width -le 0 -or $height -le 0) {
-            return
-        }
-
-        Update-State -Values @{
-            ui_window_left   = [string]$rect.Left
-            ui_window_top    = [string]$rect.Top
-            ui_window_width  = [string]$width
-            ui_window_height = [string]$height
-        }
-    }
-    catch {
-    }
-}
-
-function Restore-ConsoleWindowPlacement {
-    $state = Get-State
-    $required = @('ui_window_left', 'ui_window_top', 'ui_window_width', 'ui_window_height')
-    foreach ($name in $required) {
-        if (-not $state.ContainsKey($name) -or [string]::IsNullOrWhiteSpace([string]$state[$name])) {
-            return
-        }
-    }
-
-    try {
-        $left = [int]$state.ui_window_left
-        $top = [int]$state.ui_window_top
-        $width = [int]$state.ui_window_width
-        $height = [int]$state.ui_window_height
-        if ($width -lt 320 -or $height -lt 200) {
-            return
-        }
-
-        $handle = [HappRoutingFixConsoleApi]::GetConsoleWindow()
-        if ($handle -eq [IntPtr]::Zero) {
-            return
-        }
-
-        [HappRoutingFixConsoleApi]::MoveWindow($handle, $left, $top, $width, $height, $true) | Out-Null
-    }
-    catch {
-    }
-}
+$script:ShowAnnouncementPrompt = $false
 
 function Activate-UiWindow {
     $activated = $false
@@ -1624,71 +1651,69 @@ function Get-UiDisplayData {
     $remoteMessageText = '-'
     $remoteMessageColor = 'DarkGray'
     $remoteMessageRaw = [string]$remoteConfig.message
-    $remoteType = [string]$remoteConfig.type
-    $latestVersion = [string]$remoteConfig.latest_version
-    $disableFix = [bool]$remoteConfig.disable_fix
-    $updatePromptVisible = $false
-    $newsPromptVisible = $false
-
-    # Проверка dismissed announcements
-    $state = Get-State
-    $dismissedUpdateKey = 'dismissed_update_version'
-    $dismissedNewsKey = 'dismissed_news_hash'
-    
-    $currentUpdateKey = "update|$latestVersion"
-    $currentNewsHash = "news|$($remoteMessageRaw.GetHashCode())"
-    
-    $dismissedUpdateVersion = [string]$state[$dismissedUpdateKey]
-    $dismissedNewsHash = [string]$state[$dismissedNewsKey]
-    
-    # Логика отображения сообщения
-    if ([string]::IsNullOrWhiteSpace($remoteMessageRaw)) {
-        $remoteMessageText = '-'
-    }
-    else {
+    if (-not [string]::IsNullOrWhiteSpace($remoteMessageRaw)) {
         $remoteMessageText = $remoteMessageRaw.Trim()
     }
 
-    # Если type=update и версия новая - показываем уведомление
-    if ($remoteType -eq 'update') {
-        $versionCompare = Compare-AppVersions -LeftVersion $appVersion -RightVersion $latestVersion
-        if ($versionCompare -lt 0) {
-            $remoteMessageColor = 'Red'
-            if ([string]::IsNullOrWhiteSpace($remoteMessageText) -or $remoteMessageText -eq '-') {
-                $remoteMessageText = ('Доступна новая версия: {0}' -f $latestVersion)
-            }
-            # Показываем если не скрыто для этой версии
-            if ($dismissedUpdateVersion -ne $latestVersion) {
-                $updatePromptVisible = $true
-            }
+    $remoteType = [string]$remoteConfig.type
+    $latestVersion = [string]$remoteConfig.latest_version
+    $versionCompare = Compare-AppVersions -LeftVersion $appVersion -RightVersion $latestVersion
+    $shouldShowUpdate = ($remoteType -eq 'update' -and $versionCompare -lt 0)
+    $shouldShowNews = (($remoteType -eq 'news' -or $remoteType -eq 'new') -and -not [string]::IsNullOrWhiteSpace($remoteMessageRaw))
+    $disableFix = [bool]$remoteConfig.disable_fix
+    $updateDownloadUrl = Get-RemoteConfigDownloadUrl -RemoteConfig $remoteConfig
+    $messageUrl = [string]$remoteConfig.message_url
+    $hasMessageUrl = -not [string]::IsNullOrWhiteSpace($messageUrl)
+
+    # Логика отображения кнопок
+    $showUpdateButtons = $false
+    $showNewsButtons = $false
+    $yButtonText = 'Скачать обновление'
+
+    if ($shouldShowUpdate) {
+        # type=update, версии разные — показываем автоматом (если не dismissed) или при [6]
+        if (-not (Test-UpdatePromptDismissed -RemoteConfig $remoteConfig)) {
+            $showUpdateButtons = $true
         }
-        else {
-            # Версии совпадают или локальная новее - показываем прочерк
-            $remoteMessageText = '-'
-            $remoteMessageColor = 'DarkGray'
+        if ($script:ShowAnnouncementPrompt) {
+            $showUpdateButtons = $true
+        }
+        $yButtonText = 'Скачать обновление'
+    }
+    elseif ($remoteType -eq 'update' -and $script:ShowAnnouncementPrompt) {
+        # type=update, версии одинаковые, но нажали [6] — показываем Y/N
+        $showUpdateButtons = $true
+        $yButtonText = 'Открыть репозиторий'
+    }
+
+    if ($shouldShowNews -and $hasMessageUrl) {
+        # type=news, есть ссылка — показываем G/N всегда
+        $showNewsButtons = $true
+    }
+
+    if ($shouldShowUpdate) {
+        $remoteMessageColor = 'Red'
+        if ([string]::IsNullOrWhiteSpace($remoteMessageRaw)) {
+            $remoteMessageText = ('Доступна новая версия: {0}' -f $latestVersion)
         }
     }
-    elseif ($remoteType -eq 'news' -or $remoteType -eq 'new') {
+    elseif ($shouldShowNews) {
         $remoteMessageColor = 'DarkGray'
-        # Показываем если не скрыто навсегда
-        if ($dismissedNewsHash -ne $currentNewsHash) {
-            $newsPromptVisible = $true
-        }
     }
     else {
         $remoteMessageText = '-'
         $remoteMessageColor = 'DarkGray'
     }
-
+    
     if ($disableFix) {
         $statusText = 'ОТКЛЮЧЕН УДАЛЕННО'
         $statusColor = 'DarkRed'
+        $showUpdateButtons = $false
+        $showNewsButtons = $false
         if ($remoteMessageText -eq '-') {
             $remoteMessageText = 'Фикс временно отключен разработчиком'
         }
         $remoteMessageColor = 'Red'
-        $updatePromptVisible = $false
-        $newsPromptVisible = $false
     }
 
     return [pscustomobject]@{
@@ -1705,11 +1730,12 @@ function Get-UiDisplayData {
         f3_color = $f3Color
         remote_message_text = $remoteMessageText
         remote_message_color = $remoteMessageColor
+        show_update_buttons = $showUpdateButtons
+        show_news_buttons = $showNewsButtons
+        y_button_text = $yButtonText
+        update_download_url = $updateDownloadUrl
         disable_fix = $disableFix
-        update_prompt_visible = $updatePromptVisible
-        news_prompt_visible = $newsPromptVisible
-        current_update_key = $currentUpdateKey
-        current_news_hash = $currentNewsHash
+        message_url = $messageUrl
     }
 }
 
@@ -1725,6 +1751,28 @@ function Open-UpdateDownloadPage {
     }
     catch {
         Write-AppLogLimited -Key ('update-page-open:' + $_.Exception.Message) -Message ('Не удалось открыть страницу обновления: ' + $_.Exception.Message)
+    }
+}
+
+function Open-MessageUrl {
+    param([string]$Url)
+
+    if ([string]::IsNullOrWhiteSpace($Url)) {
+        return
+    }
+
+    # Если ссылка не начинается с http/https, добавляем https://
+    $fullUrl = $Url
+    if (-not ($Url -match '^https?://')) {
+        $fullUrl = 'https://' + $Url
+    }
+
+    try {
+        Start-Process -FilePath $fullUrl | Out-Null
+        Write-AppLog ('Ссылка из объявления открыта: {0}' -f $Url)
+    }
+    catch {
+        Write-AppLogLimited -Key ('message-url-open:' + $_.Exception.Message) -Message ('Не удалось открыть ссылку из объявления: ' + $_.Exception.Message)
     }
 }
 
@@ -1765,13 +1813,25 @@ function Render-UiScreen {
     Write-Host '[5] Открыть Telegram разработчика' -ForegroundColor DarkGray
     Write-Host '[Esc] Выход' -ForegroundColor DarkGray
     Write-Host ''
+
+    $showLink = (-not [string]::IsNullOrWhiteSpace($DisplayData.message_url))
+    
     Write-Host '[6] Объявления: ' -ForegroundColor White -NoNewline
-    Write-Host $DisplayData.remote_message_text -ForegroundColor $DisplayData.remote_message_color
-    if ($DisplayData.update_prompt_visible) {
-        Write-Host 'Y Репозиторий    N Скрыть' -ForegroundColor DarkYellow
+    if ($showLink) {
+        Write-Host $DisplayData.remote_message_text -ForegroundColor $DisplayData.remote_message_color -NoNewline
+        Write-Host ', ' -ForegroundColor DarkGray -NoNewline
+        Write-Host $DisplayData.message_url -ForegroundColor DarkCyan
     }
-    elseif ($DisplayData.news_prompt_visible) {
-        Write-Host 'N Скрыть' -ForegroundColor DarkYellow
+    else {
+        Write-Host $DisplayData.remote_message_text -ForegroundColor $DisplayData.remote_message_color
+    }
+    
+    if ($DisplayData.show_update_buttons) {
+        Write-Host ('Y {0}    N Скрыть предложение' -f $DisplayData.y_button_text) -ForegroundColor DarkYellow
+    }
+    if ($DisplayData.show_news_buttons) {
+        Write-Host 'G Открыть ссылку' -ForegroundColor Magenta -NoNewline
+        Write-Host '    N Скрыть предложение' -ForegroundColor DarkYellow
     }
     Write-Host ''
 
@@ -1874,7 +1934,6 @@ function Wait-UiKeyOrFlash {
 
 function Start-UiLoop {
     Initialize-Console
-    Restore-ConsoleWindowPlacement
 
     $uiMutexCreated = $false
     $uiMutex = New-Object System.Threading.Mutex($true, 'Local\HappRoutingUiByGulenok91', [ref]$uiMutexCreated)
@@ -1951,17 +2010,28 @@ function Handle-UiKey {
         return $false
     }
 
-    # Обработка объявлений
-    if ($display.update_prompt_visible -and ($key -eq 89)) {  # Y - репозиторий
-        Open-UpdateDownloadPage -Url 'https://github.com/gulenokdv/Report---Fix-Happ-Routing'
+    # Обработка Y — открыть репозиторий/скачать обновление
+    if ($display.show_update_buttons -and ($key -eq 89)) {
+        Dismiss-UpdatePrompt -RemoteConfig $display.remote_config
+        $script:ShowAnnouncementPrompt = $false
+        Open-UpdateDownloadPage -Url $display.update_download_url
         return $true
     }
-    if ($display.update_prompt_visible -and ($key -eq 78)) {  # N - скрыть update (до следующей версии)
-        Update-State -Values @{ dismissed_update_version = $display.remote_config.latest_version }
+
+    # Обработка N — скрыть предложение (update или news)
+    if (($display.show_update_buttons -or $display.show_news_buttons) -and ($key -eq 78)) {
+        if ($display.show_update_buttons) {
+            Dismiss-UpdatePrompt -RemoteConfig $display.remote_config
+        }
+        $script:ShowAnnouncementPrompt = $false
         return $true
     }
-    if ($display.news_prompt_visible -and ($key -eq 78)) {  # N - скрыть news (навсегда)
-        Update-State -Values @{ dismissed_news_hash = $display.current_news_hash }
+
+    # Обработка G — Открыть ссылку из news
+    if ($display.show_news_buttons -and ($key -eq 71)) {
+        if (-not [string]::IsNullOrWhiteSpace($display.message_url)) {
+            Open-MessageUrl -Url $display.message_url
+        }
         return $true
     }
 
@@ -2025,7 +2095,24 @@ function Handle-UiKey {
     }
 
     if ($key -eq 54 -or $key -eq 102) {
-        Invoke-RemoteConfigSyncManual
+        # 6 - Объявления: синхронизация и показ кнопок
+        try {
+            $changed = Invoke-RemoteConfigSync
+            if ($changed) {
+                Update-State -Values @{ status = 'обновления синхронизированы' }
+            }
+            else {
+                Update-State -Values @{ status = 'обновления не найдены' }
+            }
+        }
+        catch {
+            Update-State -Values @{
+                status             = 'ошибка синхронизации обновлений'
+                last_error_message = $_.Exception.Message
+            }
+            Write-AppLogLimited -Key ('remote-config-manual:' + $_.Exception.Message) -Message ('Ручная проверка обновлений завершилась ошибкой: ' + $_.Exception.Message)
+        }
+        $script:ShowAnnouncementPrompt = $true
         return $true
     }
 
@@ -2047,6 +2134,14 @@ function Start-AgentLoop {
             status     = 'запущено'
         }
         Write-AppLog 'Агент фикса запущен.'
+
+        # При старте агента сразу проверяем обновления (даже если прошло мало времени)
+        # Сбрасываем last_rules_update_at чтобы принудительно проверить rulesets
+        $settings = Get-Settings
+        Update-State -Values @{
+            last_rules_update_at       = '2000-01-01T00:00:00'
+            remote_config_boot_check_pending = 'true'
+        }
 
         $lastStamp = ''
         $lastMode = ''

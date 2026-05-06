@@ -59,9 +59,51 @@
 ## 📁 Файлы
 
 - `happ-routing-fix.bat` — основная консоль фикса  
-- `happ-routing-process-check.bat` — чекер процессов для отладки  
+- `happ-routing-process-check.bat` — чекер процессов. Открывает отдельное окно, которое показывает запущены ли UI-консоль и фоновый агент фикса (их PID и статус). Полезно для отладки, когда нужно понять — работает ли фикс в фоне или завис, можно убивать процессы фикса
 - `scripts/` — PowerShell-скрипты  
-- `rulesets/` — локальные rule-set файлы для sing-box (замена старых geodat)
+- `rulesets/` — локальные rule-set файлы для sing-box (замена старых geodat). Файлы скачиваются автоматически с репозитория [SagerNet/sing-geosite](https://github.com/SagerNet/sing-geosite) и [SagerNet/sing-geoip](https://github.com/SagerNet/sing-geoip):
+  - `geosite-vk.srs` — [SagerNet/sing-geosite/rule-set/geosite-vk.srs](https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-vk.srs)
+  - `geosite-category-ru.srs` — [SagerNet/sing-geosite/rule-set/geosite-category-ru.srs](https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-category-ru.srs)
+  - `geoip-ru.srs` — [SagerNet/sing-geoip/rule-set/geoip-ru.srs](https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-ru.srs)
+  
+  При автообновлении фикс проверяет ETag на сервере и скачивает только изменённые файлы, а не все подряд.
+
+### ⚙️ Конфигурационные файлы (serv/)
+
+Фикс хранит локальные и серверные настройки состояния в двух JSON-файлах в папке `serv/`.
+`happ-routing-app.json` — локальные настройки версии.
+`happ-routing-remote-config.json` — псевдо-серверная часть для объявлений.
+Не рекомендуется изменять эти файлы.
+
+#### `happ-routing-settings.json` — настройки
+
+| Поле | Описание | Значение по умолчанию |
+|------|----------|----------------------|
+| `auto_update_enabled` | Автоматически проверять и скачивать новые rulesets | `true` |
+| `auto_update_interval_min` | Интервал автообновления rulesets и remote-конфига (в минутах) | `60` |
+| `autostart_enabled` | Автозапуск фикса при старте Windows | `false` |
+| `keep_background_on_close` | Продолжать работу в фоне после закрытия консоли | `true` |
+
+**Что можно менять вручную:**
+- `auto_update_interval_min` — например, изменить с `60` на `120`, если хотите реже проверять обновления rulesets
+- `autostart_enabled` — включить автозапуск (`true` / `false`)
+
+Изменения вступают в силу при следующем запуске фикса или при перезапуске агента через `[3]`.
+
+#### `happ-routing-state.json` — состояние фикса
+
+Хранит текущее состояние работы (изменять вручную не рекомендуется):
+
+| Поле | Описание |
+|------|----------|
+| `pid` | PID фонового агента |
+| `status` | Текущий статус (например: "готово", "rulesets обновлены") |
+| `last_patch_at` | Время последнего патча config.json |
+| `last_rules_update_at` | Время последнего обновления rulesets |
+| `ruleset_etag_*` | ETag'и скачанных ruleset-файлов (для проверки — изменились ли они на сервере) |
+| `ui_session_active` / `ui_pid` | Состояние UI-консоли |
+| `next_rules_retry_at` / `next_remote_config_retry_at` | Время следующей повторной попытки при ошибке сети |
+| `update_prompt_dismissed_at` / `update_prompt_dismissed_version` | Когда и какую версию обновления пользователь скрыл кнопкой N |
 
 ---
 
@@ -88,6 +130,10 @@
 - `[3]` запустить / остановить фикс  
 - `[4]` открыть чекер процессов  
 - `[5]` Telegram разработчика  
+- `[6]` проверить объявления / обновления вручную. Показывает сообщение от разработчика и кнопки:
+  - `Y` — скачать обновление (если есть новая версия) или открыть репозиторий
+  - `N` — скрыть предложение
+  - `G` — открыть ссылку из объявления (если указана в `message_url`)
 - `F1` автозапуск Windows  
 - `F2` работа в фоне  
 - `F3` автообновление rulesets  
@@ -97,6 +143,7 @@
 - автозапуск Windows выключен  
 - работа в фоне включена  
 - автообновление rulesets включено  
+- интервал проверки обновлений — 60 минут
 
 (рекомендуется включить автозапуск)
 

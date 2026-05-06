@@ -1,7 +1,8 @@
 ﻿{
-    "message":  "удалены авто-обновления, чутка фиксов",
-    "latest_version":  "0.1.5",
+    "message":  "",
+    "latest_version":  "0.1.8",
     "type":  "update",
     "disable_fix":  false,
-    "download_url":  "https://github.com/gulenokdv/Report---Fix-Happ-Routing"
+    "download_url":  "https://github.com/gulenokdv/Report---Fix-Happ-Routing",
+    "message_url":  ""
 }

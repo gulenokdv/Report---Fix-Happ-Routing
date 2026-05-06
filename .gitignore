@@ -3,8 +3,10 @@ w
 happ-routing.log
 happ-routing-state.json
 happ-routing-settings.json
-happ-routing-remote-config-cache.json
 *.codex-backup
 
-# --- НИЧЕГО НЕ ТРОГАЕМ ---
-# (папки rulesets, scripts, serv — не игнорим)
+# --- Игнор папок ---
+rulesets/
+
+# --- НИЧЕГО НЕ ТРОГАЕМ мазафака ---
+# (папки scripts, serv — не игнорим)
