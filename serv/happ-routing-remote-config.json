@@ -1,6 +1,6 @@
 ﻿{
-    "message":  "",
-    "latest_version":  "0.1.8",
+    "message":  "добавление изменения пути до config.json, оптимизация, багфиксы и нововведения",
+    "latest_version":  "0.2.0",
     "type":  "update",
     "disable_fix":  false,
     "download_url":  "https://github.com/gulenokdv/Report---Fix-Happ-Routing",
