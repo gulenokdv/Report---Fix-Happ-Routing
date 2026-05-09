@@ -48,6 +48,13 @@ $ManagedAutostartCommandMarkers = @('happ-routing-fix.bat', 'start-happ-routing-
 $script:LogThrottle = @{}
 $script:UiShutdownHandled = $false
 $script:UiExitRequested = $false
+$script:ShowConfigPathPrompt = $false
+$script:LastAgentConfigError = ''
+$script:ConfigCriticalErrorCounts = @{}
+$script:LastObservedConfigPath = ''
+$script:LastObservedConfigStamp = ''
+
+
 
 function Get-CommandExecutablePath {
     param([string]$CommandLine)
@@ -125,9 +132,10 @@ function Get-LauncherPath {
 function Write-Utf8BomFile {
     param([string]$Path, [string]$Content)
     $lastError = $null
+    $encoding = New-Object System.Text.UTF8Encoding($true)
     foreach ($attempt in 1..8) {
         try {
-            Set-Content -LiteralPath $Path -Value $Content -Encoding UTF8 -ErrorAction Stop
+            [System.IO.File]::WriteAllText($Path, $Content, $encoding)
             return
         }
         catch {
@@ -139,6 +147,7 @@ function Write-Utf8BomFile {
         throw $lastError
     }
 }
+
 
 function Read-Utf8JsonFile {
     param([string]$Path)
@@ -279,6 +288,7 @@ function Get-DefaultSettings {
         auto_update_interval_min = 60
         autostart_enabled        = $false
         keep_background_on_close = $true
+        custom_config_path       = ''
     }
 }
 
@@ -287,7 +297,149 @@ function Save-Settings {
     Write-Utf8BomFile -Path $SettingsPath -Content (ConvertTo-ReadableJson -InputObject ([pscustomobject]$Settings))
 }
 
+function Get-EffectiveConfigPath {
+    $settings = Get-Settings
+    $custom = [string]$settings.custom_config_path
+    if (-not [string]::IsNullOrWhiteSpace($custom)) {
+        if (Test-Path -LiteralPath $custom -PathType Leaf) {
+            return $custom
+        }
+        $joined = Join-Path -Path $custom -ChildPath 'config.json'
+        if (Test-Path -LiteralPath $joined -PathType Leaf) {
+            return $joined
+        }
+        if (Test-Path -LiteralPath $custom -PathType Container) {
+            return $joined
+        }
+        return $custom
+    }
+    return "$env:LOCALAPPDATA\Happ\config.json"
+}
+
+function Add-AnnouncementError {
+    param([string]$Message)
+    $state = Get-State
+    $errors = @()
+    if ($state.ContainsKey('announcement_errors')) {
+        try {
+            $loaded = $state.announcement_errors | ConvertFrom-Json
+            if ($loaded -is [array]) {
+                $errors = @($loaded)
+            }
+        }
+        catch {}
+    }
+    $timestamp = Get-Date -Format 'HH:mm:ss'
+    $errors += "[$timestamp] $Message"
+    if ($errors.Count -gt 5) {
+        $errors = $errors[-5..-1]
+    }
+    Update-State -Values @{ announcement_errors = ($errors | ConvertTo-Json -Compress) }
+}
+
+function Get-AnnouncementErrors {
+    $state = Get-State
+    if (-not $state.ContainsKey('announcement_errors')) {
+        return @()
+    }
+    try {
+        $loaded = $state.announcement_errors | ConvertFrom-Json
+        if ($loaded -is [array]) {
+            return @($loaded)
+        }
+        return @($loaded)
+    }
+    catch {
+        return @()
+    }
+}
+
+function Clear-AnnouncementErrors {
+    Update-State -Values @{ announcement_errors = '' }
+}
+
+function Get-StateUiSignature {
+    $state = Get-State
+    $status = [string]$(if ($state.ContainsKey('status')) { $state.status } else { '' })
+    $announcementErrors = [string]$(if ($state.ContainsKey('announcement_errors')) { $state.announcement_errors } else { '' })
+    $lastErrorMessage = [string]$(if ($state.ContainsKey('last_error_message')) { $state.last_error_message } else { '' })
+    $pidValue = [string]$(if ($state.ContainsKey('pid')) { $state.pid } else { '' })
+    return ('{0}|{1}|{2}|{3}' -f $status, $announcementErrors, $lastErrorMessage, $pidValue)
+}
+
+
+function Reset-ConfigCriticalErrorTracking {
+    $script:ConfigCriticalErrorCounts = @{}
+}
+
+function Register-ConfigCriticalError {
+    param([string]$ConfigPath)
+
+    $key = [string]$ConfigPath
+    if ([string]::IsNullOrWhiteSpace($key)) {
+        $key = '__empty__'
+    }
+
+    if (-not $script:ConfigCriticalErrorCounts.ContainsKey($key)) {
+        $script:ConfigCriticalErrorCounts[$key] = 0
+    }
+
+    $script:ConfigCriticalErrorCounts[$key] = [int]$script:ConfigCriticalErrorCounts[$key] + 1
+    return [int]$script:ConfigCriticalErrorCounts[$key]
+}
+
+function Get-ConfigBanInfo {
+    $state = Get-State
+    return [pscustomobject]@{
+        path  = [string]$(if ($state.ContainsKey('banned_config_path')) { $state.banned_config_path } else { '' })
+        stamp = [string]$(if ($state.ContainsKey('banned_config_stamp')) { $state.banned_config_stamp } else { '' })
+    }
+}
+
+function Set-ConfigBanInfo {
+    param(
+        [string]$Path,
+        [string]$Stamp
+    )
+
+    Update-State -Values @{
+        banned_config_path  = [string]$Path
+        banned_config_stamp = [string]$Stamp
+    }
+}
+
+function Clear-ConfigBanInfo {
+    Update-State -Values @{
+        banned_config_path  = ''
+        banned_config_stamp = ''
+    }
+}
+
+function Test-ConfigBanned {
+    param(
+        [string]$Path,
+        [string]$Stamp
+    )
+
+    $ban = Get-ConfigBanInfo
+    if ([string]::IsNullOrWhiteSpace($ban.path)) {
+        return $false
+    }
+
+    if ([string]$ban.path -ne [string]$Path) {
+        return $false
+    }
+
+    if ([string]::IsNullOrWhiteSpace([string]$ban.stamp)) {
+        return $true
+    }
+
+    return ([string]$ban.stamp -eq [string]$Stamp)
+}
+
+
 function Get-DefaultAppInfo {
+
     return @{
         current_version     = $DefaultAppVersion
         remote_config_url   = 'https://raw.githubusercontent.com/gulenokdv/Report---Fix-Happ-Routing/main/serv/happ-routing-remote-config.json'
@@ -356,7 +508,7 @@ function Get-Settings {
     if (Test-Path -LiteralPath $SettingsPath) {
         try {
             $loaded = Read-Utf8JsonFile -Path $SettingsPath
-            foreach ($name in @('auto_update_enabled', 'auto_update_interval_min', 'autostart_enabled', 'keep_background_on_close')) {
+            foreach ($name in @('auto_update_enabled', 'auto_update_interval_min', 'autostart_enabled', 'keep_background_on_close', 'custom_config_path')) {
                 if ($loaded.PSObject.Properties[$name]) {
                     $settings[$name] = $loaded.$name
                 }
@@ -374,7 +526,7 @@ function Get-Settings {
     else {
         $needsSave = $true
     }
-
+    
     if ([int]$settings.auto_update_interval_min -lt 5) {
         $settings.auto_update_interval_min = 5
         $needsSave = $true
@@ -912,6 +1064,7 @@ function Show-ProcessMonitorScreen {
     Write-Host '[2] Убить все найденные процессы' -ForegroundColor DarkYellow
     Write-Host '[4] Запустить консольку фикса' -ForegroundColor Gray
     Write-Host '[5] Открыть Telegram разработчика' -ForegroundColor DarkGray
+    Write-Host '[8] Открыть репозиторий на GitHub' -ForegroundColor DarkGray
     Write-Host '[Esc] Выйти' -ForegroundColor DarkGray
 }
 
@@ -945,6 +1098,16 @@ function Start-ProcessMonitor {
 
         if ($key.VirtualKeyCode -eq 53 -or $key.VirtualKeyCode -eq 101) {
             Open-DeveloperTelegram
+            continue
+        }
+
+        if ($key.VirtualKeyCode -eq 56 -or $key.VirtualKeyCode -eq 104) {
+            try {
+                Start-Process -FilePath 'https://github.com/gulenokdv/Report---Fix-Happ-Routing' | Out-Null
+            }
+            catch {
+                Write-AppLogLimited -Key 'github-open' -Message 'Не удалось открыть репозиторий на GitHub.'
+            }
             continue
         }
 
@@ -1091,6 +1254,12 @@ function Invoke-RulesUpdate {
                 $currentEtag = [string]$state[$fileKey]
             }
 
+            $targetPath = Join-Path -Path $RulesDir -ChildPath $download.Name
+            $localFileExists = (Test-Path -LiteralPath $targetPath -PathType Leaf)
+            if (-not $localFileExists) {
+                Write-AppLog ('Локальный ruleset отсутствует, будет скачан заново: {0}' -f $download.Name)
+            }
+
             $serverEtag = $null
             $headSuccess = $false
 
@@ -1116,11 +1285,12 @@ function Invoke-RulesUpdate {
                 Write-AppLog ('HEAD запрос не удался для {0}: {1}' -f $download.Name, $_.Exception.Message)
             }
 
-            # Если ETag совпадает — пропускаем скачивание
-            if ($headSuccess -and $serverEtag -and $currentEtag -eq $serverEtag) {
+            # Если ETag совпадает и локальный файл уже существует — пропускаем скачивание
+            if ($localFileExists -and $headSuccess -and $serverEtag -and $currentEtag -eq $serverEtag) {
                 $unchangedCount++
                 continue
             }
+
 
             # Скачиваем файл
             $tempPath = [System.IO.Path]::GetTempFileName()
@@ -1182,16 +1352,18 @@ function Invoke-RulesUpdate {
 }
 
 function Get-ConfigStamp {
-    if (-not (Test-Path -LiteralPath $ConfigPath)) { return $null }
-    $item = Get-Item -LiteralPath $ConfigPath
+    $effectiveConfigPath = Get-EffectiveConfigPath
+    if (-not (Test-Path -LiteralPath $effectiveConfigPath)) { return $null }
+    $item = Get-Item -LiteralPath $effectiveConfigPath
     return ('{0}|{1}' -f $item.LastWriteTimeUtc.Ticks, $item.Length)
 }
 
 function Test-ConfigNeedsPatch {
-    if (-not (Test-Path -LiteralPath $ConfigPath)) { return $false }
+    $effectiveConfigPath = Get-EffectiveConfigPath
+    if (-not (Test-Path -LiteralPath $effectiveConfigPath)) { return $false }
 
     try {
-        $config = Read-Utf8JsonFile -Path $ConfigPath
+        $config = Read-Utf8JsonFile -Path $effectiveConfigPath
     }
     catch {
         return $true
@@ -1248,9 +1420,10 @@ function Test-ConfigNeedsPatch {
 }
 
 function Invoke-ConfigPatch {
-    if (-not (Test-Path -LiteralPath $ConfigPath)) { return $false }
+    $effectiveConfigPath = Get-EffectiveConfigPath
+    if (-not (Test-Path -LiteralPath $effectiveConfigPath)) { return $false }
 
-    & $PatchScript -ConfigPath $ConfigPath | Out-Null
+    & $PatchScript -ConfigPath $effectiveConfigPath | Out-Null
     Update-State -Values @{
         last_patch_at = (Get-Date).ToString('s')
         status        = 'пропатчено'
@@ -1262,9 +1435,10 @@ function Invoke-ConfigPatch {
 function Invoke-BurstPatch {
     $deadline = (Get-Date).AddMilliseconds(2500)
     $attempts = 0
+    $effectiveConfigPath = Get-EffectiveConfigPath
 
     while ((Get-Date) -lt $deadline) {
-        if (Test-Path -LiteralPath $ConfigPath) {
+        if (Test-Path -LiteralPath $effectiveConfigPath) {
             try {
                 if (Invoke-ConfigPatch) {
                     $attempts++
@@ -1552,6 +1726,15 @@ function Start-LauncherWindow {
     }
 }
 
+function Restart-FixUi {
+    $launcherPath = Join-Path -Path $AppRoot -ChildPath 'happ-routing-fix.bat'
+    $null = Stop-AgentProcess -SetDesired $false
+    Start-Sleep -Milliseconds 250
+    Start-Process -FilePath $launcherPath | Out-Null
+    $script:UiExitRequested = $true
+}
+
+
 function Start-ProcessCheckerWindow {
     $checkerPath = Join-Path -Path $AppRoot -ChildPath 'happ-routing-process-check.bat'
     Start-Process -FilePath $checkerPath | Out-Null
@@ -1625,14 +1808,37 @@ function Read-ProcessMonitorKey {
 
 function Get-UiDisplayData {
     $status = Get-StatusObject
+    $settings = Get-Settings
     $appVersion = Get-AppVersion
     $remoteConfig = Get-RemoteConfig
     $statusText = 'НЕ ЗАПУЩЕНО'
     $statusColor = 'DarkRed'
+
+    $rawStatus = [string]$status.status
     if ($status.running) {
         $statusText = 'ЗАПУЩЕНО'
         $statusColor = 'Green'
     }
+
+    if (-not [string]::IsNullOrWhiteSpace($rawStatus)) {
+        if ($rawStatus -eq 'ОШИБКА КОНФИГА') {
+            $statusText = 'ОШИБКА КОНФИГА'
+            $statusColor = 'Red'
+        }
+        elseif ($rawStatus -like 'ошибка*') {
+            $statusText = $rawStatus.ToUpperInvariant()
+            $statusColor = 'DarkRed'
+        }
+        elseif ($rawStatus -eq 'ожидание config.json от Happ') {
+            $statusText = 'ОЖИДАНИЕ CONFIG.JSON'
+            $statusColor = 'DarkYellow'
+        }
+        elseif (-not $status.running) {
+            $statusText = $rawStatus.ToUpperInvariant()
+            $statusColor = 'DarkRed'
+        }
+    }
+
 
     $f1Text = 'выкл'
     $f2Text = 'выкл'
@@ -1716,6 +1922,13 @@ function Get-UiDisplayData {
         $remoteMessageColor = 'Red'
     }
 
+    $customConfigPath = [string]$settings.custom_config_path
+    $effectiveConfigPath = Get-EffectiveConfigPath
+    $displayConfigPath = ''
+    if (-not [string]::IsNullOrWhiteSpace($customConfigPath)) {
+        $displayConfigPath = $effectiveConfigPath
+    }
+
     return [pscustomobject]@{
         status = $status
         remote_config = $remoteConfig
@@ -1736,8 +1949,13 @@ function Get-UiDisplayData {
         update_download_url = $updateDownloadUrl
         disable_fix = $disableFix
         message_url = $messageUrl
+        announcement_errors = @(Get-AnnouncementErrors)
+        custom_config_path = $customConfigPath
+        effective_config_path = [string]$effectiveConfigPath
+        display_config_path = [string]$displayConfigPath
     }
 }
+
 
 function Open-UpdateDownloadPage {
     param([string]$Url)
@@ -1791,10 +2009,11 @@ function Render-UiScreen {
     Clear-Host
     Write-TelegramLink
     Write-Host ''
-    Write-Host 'Когда статус ЗАПУЩЕНО - переподключитесь в Happ. Иногда может потребоваться повторно переподключиться (например при старте Windows)' -ForegroundColor Yellow
-    Write-Host 'Если после двух переподключений фикс ' -ForegroundColor DarkYellow -NoNewline
-    Write-Host 'не работает' -ForegroundColor White -NoNewline
-    Write-Host ' - полностью выключите Happ (даже в tray), запустите заново и переподключитесь 1-2 раза.' -ForegroundColor DarkYellow
+    Write-Host 'Когда статус ЗАПУЩЕНО - переподключитесь в Happ. Иногда может потребоваться повторно переподключиться 2 раза' -ForegroundColor Yellow
+    Write-Host '(например при старте Windows)' -ForegroundColor Yellow
+    Write-Host 'Если после двух переподключений фикс не работает - полностью выключите Happ (даже в tray),' -ForegroundColor DarkYellow
+    Write-Host 'нажмите [9] для полного перезапуска фикса и после переподключитесь, также 1-2 раза.' -ForegroundColor DarkYellow
+
     Write-Host ''
     Write-Host ('СТАТУС: {0}' -f $DisplayData.status_text) -ForegroundColor $DisplayData.status_color
     Write-Host ('PID: {0}' -f $(if ($DisplayData.status.pid) { $DisplayData.status.pid } else { '-' })) -ForegroundColor Cyan
@@ -1810,8 +2029,22 @@ function Render-UiScreen {
     Write-Host '[2] Открыть лог' -ForegroundColor DarkCyan
     Write-Host '[3] Запустить/остановить фикс' -ForegroundColor Red
     Write-Host '[4] Запустить чекер процессов' -ForegroundColor Gray
-    Write-Host '[5] Открыть Telegram разработчика' -ForegroundColor DarkGray
+    Write-Host '[5] Изменить путь до config.json' -ForegroundColor Gray
+    if (-not [string]::IsNullOrWhiteSpace($DisplayData.display_config_path) -and -not $script:ShowConfigPathPrompt) {
+        Write-Host $DisplayData.display_config_path -ForegroundColor DarkGray
+    }
+
+    if ($script:ShowConfigPathPrompt) {
+        Write-Host ' Выберите файл config.json или папку, где он находится.' -ForegroundColor DarkYellow
+        Write-Host ' Дефолтный путь: AppData\Local\Happ\config.json' -ForegroundColor DarkYellow
+        Write-Host ' Отмена выбора файла возвращает дефолт путь.' -ForegroundColor DarkYellow
+        Write-Host ''
+    }
+    Write-Host '[7] Открыть Telegram разработчика' -ForegroundColor DarkGray
+    Write-Host '[8] Открыть репозиторий на GitHub' -ForegroundColor DarkGray
+    Write-Host '[9] Полный перезапуск фикса' -ForegroundColor DarkMagenta
     Write-Host '[Esc] Выход' -ForegroundColor DarkGray
+
     Write-Host ''
 
     $showLink = (-not [string]::IsNullOrWhiteSpace($DisplayData.message_url))
@@ -1825,13 +2058,20 @@ function Render-UiScreen {
     else {
         Write-Host $DisplayData.remote_message_text -ForegroundColor $DisplayData.remote_message_color
     }
-    
+
     if ($DisplayData.show_update_buttons) {
         Write-Host ('Y {0}    N Скрыть предложение' -f $DisplayData.y_button_text) -ForegroundColor DarkYellow
     }
     if ($DisplayData.show_news_buttons) {
         Write-Host 'G Открыть ссылку' -ForegroundColor Magenta -NoNewline
         Write-Host '    N Скрыть предложение' -ForegroundColor DarkYellow
+    }
+
+    $announcementErrors = @($DisplayData.announcement_errors)
+    if ($announcementErrors.Count -gt 0) {
+        foreach ($err in $announcementErrors) {
+            Write-Host $err -ForegroundColor Red
+        }
     }
     Write-Host ''
 
@@ -1906,6 +2146,8 @@ function Invoke-UiFlashAnimation {
 function Wait-UiKeyOrFlash {
     param([string]$LastFlashRequest)
 
+    $lastUiSignature = Get-StateUiSignature
+
     while ($true) {
         $state = Get-State
         $currentFlashRequest = ''
@@ -1921,6 +2163,14 @@ function Wait-UiKeyOrFlash {
             }
         }
 
+        $currentUiSignature = Get-StateUiSignature
+        if ($currentUiSignature -ne $lastUiSignature) {
+            return [pscustomobject]@{
+                key = $null
+                flash_request = $LastFlashRequest
+            }
+        }
+
         if ([Console]::KeyAvailable) {
             return [pscustomobject]@{
                 key = Read-UiKey
@@ -1931,6 +2181,7 @@ function Wait-UiKeyOrFlash {
         Start-Sleep -Milliseconds 80
     }
 }
+
 
 function Start-UiLoop {
     Initialize-Console
@@ -2090,11 +2341,161 @@ function Handle-UiKey {
     }
 
     if ($key -eq 53 -or $key -eq 101) {
+        # [5] - Изменить путь до config.json
+        if (-not $script:ShowConfigPathPrompt) {
+            # Первое нажатие - показываем текст и ждём перед диалогом
+            $script:ShowConfigPathPrompt = $true
+            Show-UiScreen
+            Start-Sleep -Milliseconds 1800
+            
+            $selectedPath = ''
+            $selectionCancelled = $false
+            try {
+                Add-Type -AssemblyName System.Windows.Forms | Out-Null
+                $dlg = New-Object System.Windows.Forms.OpenFileDialog
+                $dlg.Title = 'Выберите config.json Happ'
+                $dlg.Filter = 'config.json|config.json|Все файлы|*.*'
+                $dlg.FileName = ''
+                $dlg.InitialDirectory = "$env:LOCALAPPDATA\Happ"
+
+                # Создаём невидимую форму-родитель с TopMost, чтобы диалог был поверх консоли
+                $parentForm = New-Object System.Windows.Forms.Form
+                $parentForm.TopMost = $true
+                $parentForm.WindowState = 'Minimized'
+                $parentForm.ShowInTaskbar = $false
+                $parentForm.StartPosition = 'Manual'
+                $parentForm.Location = New-Object System.Drawing.Point(-10000, -10000)
+                [void]$parentForm.Show()
+                [void]$parentForm.Focus()
+
+                $result = $dlg.ShowDialog($parentForm)
+                $parentForm.Dispose()
+
+                if ($result -eq [System.Windows.Forms.DialogResult]::OK -and -not [string]::IsNullOrWhiteSpace($dlg.FileName)) {
+                    $selectedPath = $dlg.FileName
+                }
+                else {
+                    $selectionCancelled = $true
+                }
+            }
+            catch {
+                Write-AppLog "Ошибка при выборе пути к config.json: $($_.Exception.Message)"
+                $selectionCancelled = $true
+            }
+
+            # Очищаем накопленные нажатия клавиш, пока был открыт диалог
+            while ([Console]::KeyAvailable) {
+                $null = [Console]::ReadKey($false)
+            }
+
+            if ($selectionCancelled -or [string]::IsNullOrWhiteSpace($selectedPath)) {
+                # Отмена выбора - сброс на дефолт
+                $settings = Get-DefaultSettings
+                $current = Get-Settings
+                foreach ($k in @($settings.Keys)) { $settings[$k] = $current.$k }
+                $settings['custom_config_path'] = ''
+                Save-Settings -Settings $settings
+                $script:ShowConfigPathPrompt = $false
+                Clear-AnnouncementErrors
+                Write-AppLog 'Путь к config.json сброшен на дефолтный.'
+                
+                # Принудительно обновляем статус в state
+                Update-State -Values @{ status = 'дефолтный путь' }
+                
+                Stop-AgentProcess -SetDesired $false
+                Start-Sleep -Milliseconds 200
+                Start-AgentProcess -SetDesired $true
+                Start-Sleep -Milliseconds 200
+                Show-UiScreen
+                return $true
+            }
+
+            # Проверяем валидность выбранного пути
+            $effectivePath = ''
+            $pathValid = $false
+            
+            if (Test-Path -LiteralPath $selectedPath -PathType Leaf) {
+                $effectivePath = $selectedPath
+                $pathValid = $true
+            }
+            else {
+                $effectivePath = $selectedPath
+                $pathValid = $false
+            }
+
+            if (-not $pathValid) {
+                # Путь не валиден - оставляем текст, не сохраняем путь
+                Write-AppLog "Выбран неверный путь к config.json: $effectivePath"
+                Show-UiScreen
+                return $true
+            }
+
+            # Путь валиден - сохраняем, перезапускаем агент, скрываем текст
+            $settings = Get-DefaultSettings
+            $current = Get-Settings
+            foreach ($k in @($settings.Keys)) { $settings[$k] = $current.$k }
+            $settings['custom_config_path'] = $effectivePath
+            Save-Settings -Settings $settings
+            $script:ShowConfigPathPrompt = $false
+            Clear-AnnouncementErrors
+            Write-AppLog "Установлен путь к config.json: $effectivePath"
+
+            # Принудительно обновляем статус в state
+            Update-State -Values @{ status = 'смена конфига' }
+            
+            Stop-AgentProcess -SetDesired $false
+            Start-Sleep -Milliseconds 300
+            Start-AgentProcess -SetDesired $true
+            Start-Sleep -Milliseconds 500
+            Show-UiScreen
+            return $true
+        }
+        else {
+            # Повторное нажатие [5] - сброс на дефолт
+            $settings = Get-DefaultSettings
+            $current = Get-Settings
+            foreach ($k in @($settings.Keys)) { $settings[$k] = $current.$k }
+            $settings['custom_config_path'] = ''
+            Save-Settings -Settings $settings
+            $script:ShowConfigPathPrompt = $false
+            Clear-AnnouncementErrors
+            Write-AppLog 'Путь к config.json сброшен на дефолтный.'
+            
+            # Принудительно обновляем статус в state
+            Update-State -Values @{ status = 'дефолтный путь' }
+            
+            Stop-AgentProcess -SetDesired $false
+            Start-Sleep -Milliseconds 200
+            Start-AgentProcess -SetDesired $true
+            Start-Sleep -Milliseconds 200
+            Show-UiScreen
+            return $true
+        }
+    }
+
+    if ($key -eq 55 -or $key -eq 103) {
         Open-DeveloperTelegram
         return $true
     }
 
+    if ($key -eq 56 -or $key -eq 104) {
+        try {
+            Start-Process -FilePath 'https://github.com/gulenokdv/Report---Fix-Happ-Routing' | Out-Null
+        }
+        catch {
+            Write-AppLogLimited -Key 'github-open' -Message 'Не удалось открыть репозиторий на GitHub.'
+        }
+        return $true
+    }
+
+    if ($key -eq 57 -or $key -eq 105) {
+        Write-AppLog 'Запрошен полный перезапуск фикса из UI.'
+        Restart-FixUi
+        return $false
+    }
+
     if ($key -eq 54 -or $key -eq 102) {
+
         # 6 - Объявления: синхронизация и показ кнопок
         try {
             $changed = Invoke-RemoteConfigSync
@@ -2148,6 +2549,7 @@ function Start-AgentLoop {
         $lastAutostartSyncAt = [datetime]::MinValue
 
         while ($true) {
+            try {
             $settings = Get-Settings
 
             if ([bool]$settings.autostart_enabled -and (((Get-Date) - $lastAutostartSyncAt).TotalSeconds -ge 30)) {
@@ -2208,14 +2610,67 @@ function Start-AgentLoop {
                 }
             }
 
-            if (-not (Test-Path -LiteralPath $ConfigPath)) {
+            $effectiveConfigPath = Get-EffectiveConfigPath
+            if (-not (Test-Path -LiteralPath $effectiveConfigPath)) {
+                if (-not [string]::IsNullOrWhiteSpace($script:LastObservedConfigPath) -or -not [string]::IsNullOrWhiteSpace($script:LastObservedConfigStamp)) {
+                    Reset-ConfigCriticalErrorTracking
+                    Clear-ConfigBanInfo
+                    $script:LastObservedConfigPath = ''
+                    $script:LastObservedConfigStamp = ''
+                }
                 Update-State -Values @{ status = 'ожидание config.json от Happ' }
+                if ($script:LastAgentConfigError -ne 'not-found') {
+                    $script:LastAgentConfigError = 'not-found'
+                    Write-AppLogLimited -Key 'config-missing' -Message ("config.json не найден: $effectiveConfigPath")
+                    Add-AnnouncementError -Message ("config.json не найден: $effectiveConfigPath. Нажмите [5] и выберите правильный путь.")
+                }
                 $lastMode = 'waiting config'
-                Start-Sleep -Milliseconds 200
+                Start-Sleep -Seconds 1
                 continue
             }
 
+
             $currentStamp = Get-ConfigStamp
+            $configIdentityChanged = ($script:LastObservedConfigPath -ne [string]$effectiveConfigPath -or $script:LastObservedConfigStamp -ne [string]$currentStamp)
+            if ($configIdentityChanged) {
+                Reset-ConfigCriticalErrorTracking
+                $ban = Get-ConfigBanInfo
+                $hasStaleBan = (-not [string]::IsNullOrWhiteSpace($ban.path) -and -not ([string]$ban.path -eq [string]$effectiveConfigPath -and [string]$ban.stamp -eq [string]$currentStamp))
+                if ($script:LastAgentConfigError -eq 'disabled' -or $hasStaleBan) {
+                    Clear-ConfigBanInfo
+                    Clear-AnnouncementErrors
+                    Write-AppLog ("Блокировка config.json снята из-за смены пути или файла: $effectiveConfigPath")
+                }
+                $script:LastAgentConfigError = ''
+                $script:LastObservedConfigPath = [string]$effectiveConfigPath
+                $script:LastObservedConfigStamp = [string]$currentStamp
+            }
+
+            $isBannedConfig = Test-ConfigBanned -Path $effectiveConfigPath -Stamp $currentStamp
+
+            if ($isBannedConfig) {
+                if ($script:LastAgentConfigError -ne 'disabled') {
+                    $script:LastAgentConfigError = 'disabled'
+                    Update-State -Values @{
+                        status             = 'ОШИБКА КОНФИГА'
+                        last_error_message = 'Выбранный config.json отключен после 6 критических ошибок.'
+                    }
+                    Add-AnnouncementError -Message ('ОШИБКА КОНФИГА: этот config.json временно отключен после 6 критических ошибок. Выберите другой путь через [5].')
+                    Write-AppLog ("Пропуск забаненного config.json: $effectiveConfigPath")
+                }
+                $lastMode = 'config banned'
+                Start-Sleep -Seconds 2
+                continue
+            }
+
+            if ($script:LastAgentConfigError -eq 'not-found') {
+                Clear-AnnouncementErrors
+                Write-AppLog "config.json найден: $effectiveConfigPath"
+                $script:LastAgentConfigError = ''
+            }
+
+
+
             if ([string]::IsNullOrWhiteSpace($lastStamp)) {
                 $lastStamp = [string]$currentStamp
             }
@@ -2233,15 +2688,21 @@ function Start-AgentLoop {
                 try {
                     $null = Invoke-ConfigPatch
                     $lastStamp = [string](Get-ConfigStamp)
+                    Update-State -Values @{ status = 'готово'; last_error_message = '' }
                     $lastMode = 'patched'
+                    Clear-AnnouncementErrors
+                    Write-AppLog "config.json успешно пропатчен: $effectiveConfigPath"
                 }
+
                 catch {
                     Update-State -Values @{
                         status             = 'ошибка патча'
                         last_error_message = $_.Exception.Message
                     }
                     if ($lastMode -ne 'patch failed') {
-                        Write-AppLogLimited -Key ('patch:' + $_.Exception.Message) -Message ('Патч config.json завершился ошибкой: ' + $_.Exception.Message)
+                        $errorMsg = 'Патч config.json невозможен: ' + $_.Exception.Message
+                        Write-AppLogLimited -Key ('patch:' + $_.Exception.Message) -Message $errorMsg
+                        Add-AnnouncementError -Message $errorMsg
                     }
                     $lastMode = 'patch failed'
                 }
@@ -2251,7 +2712,41 @@ function Start-AgentLoop {
                 $lastMode = 'ready'
             }
 
-            Start-Sleep -Milliseconds 50
+            Start-Sleep -Milliseconds 250
+
+            }
+            catch {
+                $errMsg = $_.Exception.Message
+                $displayErr = $errMsg
+                if ($displayErr -match 'route' -or $displayErr -match 'config') {
+                    $displayErr = 'Выбран неправильный config.json.'
+                }
+
+                $criticalCount = Register-ConfigCriticalError -ConfigPath $effectiveConfigPath
+                Update-State -Values @{
+                    status             = 'ОШИБКА КОНФИГА'
+                    last_error_message = $errMsg
+                }
+
+                if ($criticalCount -le 6) {
+                    Write-AppLogLimited -Key ('agent-critical:' + $errMsg) -Message ('Критическая ошибка агента: ' + $errMsg)
+                    Add-AnnouncementError -Message ('ОШИБКА КОНФИГА: ' + $displayErr)
+                }
+
+                if ($criticalCount -ge 6) {
+                    $script:LastAgentConfigError = 'disabled'
+                    Set-ConfigBanInfo -Path $effectiveConfigPath -Stamp $currentStamp
+                    Update-State -Values @{ status = 'ОШИБКА КОНФИГА' }
+                    Write-AppLog ("Конфиг отключен после 6 критических ошибок: $effectiveConfigPath")
+                    Add-AnnouncementError -Message ('ОШИБКА КОНФИГА: этот config.json временно отключен после 6 критических ошибок. Выберите другой путь через [5].')
+                    Start-Sleep -Seconds 2
+                    continue
+                }
+
+
+                Start-Sleep -Seconds 5
+            }
+
         }
     }
     finally {
