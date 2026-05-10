@@ -1073,58 +1073,74 @@ function Start-ProcessMonitor {
     $Host.UI.RawUI.WindowTitle = 'Happ Routing Fix - process check'
     $lastKilledCount = -1
 
-    while ($true) {
-        $errorMessage = ''
-        $processes = @()
-        try {
-            $processes = @(Get-RelatedFixProcesses)
-        }
-        catch {
-            $errorMessage = $_.Exception.Message
-        }
+    # Регистрируем обработчик выхода для корректного завершения
+    $exitHandler = [System.EventHandler]{
+        param($sender, $args)
+        # Просто выходим без действий - процесс чекера должен умереть
+    }
+    [System.AppDomain]::CurrentDomain.add_ProcessExit($exitHandler)
 
-        Show-ProcessMonitorScreen -Processes $processes -ErrorMessage $errorMessage -KilledCount $lastKilledCount
-        $lastKilledCount = -1
-        $key = Read-ProcessMonitorKey
-
-        if ($key.VirtualKeyCode -eq 27) {
-            break
-        }
-
-        if ($key.VirtualKeyCode -eq 52 -or $key.VirtualKeyCode -eq 100) {
-            Start-LauncherWindow
-            continue
-        }
-
-        if ($key.VirtualKeyCode -eq 53 -or $key.VirtualKeyCode -eq 101) {
-            Open-DeveloperTelegram
-            continue
-        }
-
-        if ($key.VirtualKeyCode -eq 56 -or $key.VirtualKeyCode -eq 104) {
+    try {
+        while ($true) {
+            $errorMessage = ''
+            $processes = @()
             try {
-                Start-Process -FilePath 'https://github.com/gulenokdv/Report---Fix-Happ-Routing' | Out-Null
+                $processes = @(Get-RelatedFixProcesses)
             }
             catch {
-                Write-AppLogLimited -Key 'github-open' -Message 'Не удалось открыть репозиторий на GitHub.'
+                $errorMessage = $_.Exception.Message
             }
-            continue
-        }
 
-        if ($key.VirtualKeyCode -eq 50 -or $key.VirtualKeyCode -eq 98) {
-            $killed = 0
-            foreach ($process in @($processes)) {
+            Show-ProcessMonitorScreen -Processes $processes -ErrorMessage $errorMessage -KilledCount $lastKilledCount
+            $lastKilledCount = -1
+            $key = Read-ProcessMonitorKey
+
+            if ($key.VirtualKeyCode -eq 27) {
+                break
+            }
+
+            if ($key.VirtualKeyCode -eq 52 -or $key.VirtualKeyCode -eq 100) {
+                Start-LauncherWindow
+                continue
+            }
+
+            if ($key.VirtualKeyCode -eq 53 -or $key.VirtualKeyCode -eq 101) {
+                Open-DeveloperTelegram
+                continue
+            }
+
+            if ($key.VirtualKeyCode -eq 56 -or $key.VirtualKeyCode -eq 104) {
                 try {
-                    Stop-Process -Id $process.ProcessId -Force -ErrorAction Stop
-                    $killed++
+                    Start-Process -FilePath 'https://github.com/gulenokdv/Report---Fix-Happ-Routing' | Out-Null
                 }
                 catch {
+                    Write-AppLogLimited -Key 'github-open' -Message 'Не удалось открыть репозиторий на GitHub.'
                 }
+                continue
             }
 
-            Update-State -Values @{ desired_running = 'false'; pid = ''; status = 'остановлено' }
-            $lastKilledCount = $killed
+            if ($key.VirtualKeyCode -eq 50 -or $key.VirtualKeyCode -eq 98) {
+                $killed = 0
+                foreach ($process in @($processes)) {
+                    try {
+                        Stop-Process -Id $process.ProcessId -Force -ErrorAction Stop
+                        $killed++
+                    }
+                    catch {
+                    }
+                }
+
+                Update-State -Values @{ desired_running = 'false'; pid = ''; status = 'остановлено' }
+                $lastKilledCount = $killed
+            }
         }
+    }
+    finally {
+        # Очистка обработчика при выходе
+        try {
+            [System.AppDomain]::CurrentDomain.remove_ProcessExit($exitHandler)
+        }
+        catch {}
     }
 }
 
@@ -1139,29 +1155,35 @@ function Invoke-UiShutdown {
     Update-State -Values @{ ui_session_active = 'false'; ui_pid = '' }
     $settings = Get-Settings
 
-    if ([bool]$settings.keep_background_on_close) {
-        $agent = Get-AgentProcess
-        if ($null -ne $agent) {
-            $state = Get-State
-            $noticeShown = $false
-            if ($state.ContainsKey('background_notice_shown') -and [string]$state.background_notice_shown -eq 'true') {
-                $noticeShown = $true
-            }
+    # Если агент выключен - консоль умирает полностью, без запуска watcher
+    $agent = Get-AgentProcess
+    if ($null -eq $agent) {
+        # Агент уже остановлен - просто завершаем процесс UI
+        return
+    }
 
-            if ($ShowBackgroundNotice -and -not $noticeShown) {
-                try {
-                    Show-WindowsNotification -Title 'Happ Routing Fix' -Message 'Фикс продолжает работать в фоне. Повторный запуск батника раскроет существующую консоль.'
-                    Update-State -Values @{ background_notice_shown = 'true' }
-                    Write-AppLog 'Показано уведомление о работе фикса в фоне.'
-                }
-                catch {
-                    Write-AppLogLimited -Key ('background-notice-inline:' + $_.Exception.Message) -Message ('Не удалось показать встроенное фоновое уведомление: ' + $_.Exception.Message)
-                }
+    # Агент запущен - проверяем настройки фона
+    if ([bool]$settings.keep_background_on_close) {
+        $state = Get-State
+        $noticeShown = $false
+        if ($state.ContainsKey('background_notice_shown') -and [string]$state.background_notice_shown -eq 'true') {
+            $noticeShown = $true
+        }
+
+        if ($ShowBackgroundNotice -and -not $noticeShown) {
+            try {
+                Show-WindowsNotification -Title 'Happ Routing Fix' -Message 'Фикс продолжает работать в фоне. Повторный запуск батника раскроет существующую консоль.'
+                Update-State -Values @{ background_notice_shown = 'true' }
+                Write-AppLog 'Показано уведомление о работе фикса в фоне.'
+            }
+            catch {
+                Write-AppLogLimited -Key ('background-notice-inline:' + $_.Exception.Message) -Message ('Не удалось показать встроенное фоновое уведомление: ' + $_.Exception.Message)
             }
         }
         return
     }
 
+    # F2 выкл - агент останавливается
     try {
         $null = Stop-AgentProcess -SetDesired $false
     }
@@ -1170,6 +1192,16 @@ function Invoke-UiShutdown {
 }
 
 function Start-UiCloseWatcher {
+    # Запускаем watcher только если агент активен и F2 включен
+    $agent = Get-AgentProcess
+    if ($null -eq $agent) {
+        return
+    }
+    $settings = Get-Settings
+    if (-not [bool]$settings.keep_background_on_close) {
+        return
+    }
+
     $scriptPath = Join-Path -Path $ScriptRoot -ChildPath 'happ-routing.ps1'
     $argumentLine = ('-NoLogo -NoProfile -STA -ExecutionPolicy Bypass -File "{0}" -Action watch-ui-close -UiPid {1}' -f $scriptPath, $PID)
     Start-Process -FilePath 'powershell.exe' -ArgumentList $argumentLine -WindowStyle Hidden | Out-Null
@@ -1729,7 +1761,7 @@ function Start-LauncherWindow {
 function Restart-FixUi {
     $launcherPath = Join-Path -Path $AppRoot -ChildPath 'happ-routing-fix.bat'
     $null = Stop-AgentProcess -SetDesired $false
-    Start-Sleep -Milliseconds 250
+    Start-Sleep -Milliseconds 400
     Start-Process -FilePath $launcherPath | Out-Null
     $script:UiExitRequested = $true
 }
@@ -2013,7 +2045,8 @@ function Render-UiScreen {
     Write-Host '(например при старте Windows)' -ForegroundColor Yellow
     Write-Host 'Если после двух переподключений фикс не работает - полностью выключите Happ (даже в tray),' -ForegroundColor DarkYellow
     Write-Host 'нажмите [9] для полного перезапуска фикса и после переподключитесь, также 1-2 раза.' -ForegroundColor DarkYellow
-
+    Write-Host 'Некоторые антивирусы (Kaspersky 100%) могут блокировать TUN-режим в Happ — фикс может не работать.' -ForegroundColor DarkGray
+    Write-Host 'Настройте/отключите свой антивирус при каких либо проблемах с фиксом, после перезапустите фикс [9] и Happ.' -ForegroundColor DarkGray
     Write-Host ''
     Write-Host ('СТАТУС: {0}' -f $DisplayData.status_text) -ForegroundColor $DisplayData.status_color
     Write-Host ('PID: {0}' -f $(if ($DisplayData.status.pid) { $DisplayData.status.pid } else { '-' })) -ForegroundColor Cyan
