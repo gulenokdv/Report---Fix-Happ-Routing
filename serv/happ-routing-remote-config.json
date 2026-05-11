@@ -1,6 +1,6 @@
 ﻿{
-    "message":  "добавление изменения пути до config.json, оптимизация, багфиксы и нововведения",
-    "latest_version":  "0.2.1",
+    "message":  "фикс серверной части, добавление отложенного запуска delayed_autostart_enabled",
+    "latest_version":  "0.2.2",
     "type":  "update",
     "disable_fix":  false,
     "download_url":  "https://github.com/gulenokdv/Report---Fix-Happ-Routing",

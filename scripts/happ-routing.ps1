@@ -3,6 +3,7 @@
     [ValidateSet(
         'ui',
         'agent',
+        'autostart-bootstrap',
         'watch-ui-close',
         'ensure-defaults',
         'status-lines',
@@ -288,6 +289,7 @@ function Get-DefaultSettings {
         auto_update_interval_min = 60
         autostart_enabled        = $false
         keep_background_on_close = $true
+        delayed_autostart_enabled = $true
         custom_config_path       = ''
     }
 }
@@ -508,9 +510,12 @@ function Get-Settings {
     if (Test-Path -LiteralPath $SettingsPath) {
         try {
             $loaded = Read-Utf8JsonFile -Path $SettingsPath
-            foreach ($name in @('auto_update_enabled', 'auto_update_interval_min', 'autostart_enabled', 'keep_background_on_close', 'custom_config_path')) {
+            foreach ($name in @('auto_update_enabled', 'auto_update_interval_min', 'autostart_enabled', 'keep_background_on_close', 'delayed_autostart_enabled', 'custom_config_path')) {
                 if ($loaded.PSObject.Properties[$name]) {
                     $settings[$name] = $loaded.$name
+                }
+                else {
+                    $needsSave = $true
                 }
             }
 
@@ -939,6 +944,47 @@ function Start-AgentProcess {
 
     Start-Sleep -Milliseconds 300
     return $process.Id
+}
+
+function Start-AutostartBootstrap {
+    $settings = Get-Settings
+    $null = Set-AutostartEntry -Enabled ([bool]$settings.autostart_enabled)
+
+    if (-not (Get-DesiredRunning)) {
+        return [pscustomobject]@{
+            ok      = $true
+            started = $false
+            reason  = 'desired running disabled'
+        }
+    }
+
+    Update-State -Values @{ remote_config_boot_check_pending = 'true' }
+
+    if (-not [bool]$settings.delayed_autostart_enabled) {
+        return [pscustomobject]@{
+            ok      = $true
+            started = $true
+            pid     = [string](Start-AgentProcess -SetDesired $false)
+            delayed = $false
+        }
+    }
+
+    Start-Sleep -Seconds 2
+    $firstPid = Start-AgentProcess -SetDesired $false
+
+    Start-Sleep -Milliseconds 1500
+    $null = Stop-AgentProcess -SetDesired $false
+
+    Start-Sleep -Seconds 1
+    $secondPid = Start-AgentProcess -SetDesired $false
+
+    return [pscustomobject]@{
+        ok         = $true
+        started    = $true
+        first_pid  = [string]$firstPid
+        second_pid = [string]$secondPid
+        delayed    = $true
+    }
 }
 
 function Stop-AgentProcess {
@@ -2804,6 +2850,10 @@ switch ($Action) {
 
     'agent' {
         Start-AgentLoop
+    }
+
+    'autostart-bootstrap' {
+        Start-AutostartBootstrap | ConvertTo-Json -Depth 10
     }
 
     'watch-ui-close' {

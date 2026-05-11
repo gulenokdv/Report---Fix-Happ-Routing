@@ -8,8 +8,7 @@ set "ROOT=%~dp0"
 set "SCRIPT=%ROOT%scripts\happ-routing.ps1"
 
 if /i "%~1"=="/background" (
-    powershell -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT%" -Action ensure-defaults >nul 2>nul
-    powershell -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT%" -Action start-agent-if-enabled >nul 2>nul
+    powershell -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT%" -Action autostart-bootstrap >nul 2>nul
     endlocal & exit /b %errorlevel%
 )
 
